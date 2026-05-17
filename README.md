@@ -97,10 +97,14 @@ exist in vendored HarfBuzz 13.x), use that function's callers to find
 `hb_shape_full`, verify by disassembly heuristics, drop the offset into
 `signatures.json`, run the Wikipedia verification.
 
-`tools/find_xref.py` is a self-configuring fallback when Binja MCP is
-unresponsive — reads ELF program headers to locate `.text`, no per-build
-constants. Invoke as `python3 tools/find_xref.py <hex_target_va>
-[path/to/binary]`.
+`tools/find_xref.py` and `tools/find_callers.py` together let you run the
+whole refresh **without Binja** — the first finds LEA xrefs to a string or
+data VA, the second finds direct `CALL`/`JMP` sites to a function VA.
+Both self-configure from ELF program headers (no per-build constants).
+Invoke as `python3 tools/find_xref.py <hex_target_va> [path/to/binary]`
+and `python3 tools/find_callers.py <hex_target_va> [path/to/binary]
+[--include-jmp]`. The "No-Binja path" boxes in FINDING_OFFSETS.md cover
+the full procedure.
 
 ## Known limits
 
@@ -138,7 +142,8 @@ constants. Invoke as `python3 tools/find_xref.py <hex_target_va>
 | `capture.js` | Frida agent: renderer-gated, hooks `hb_shape_full`, reads `buffer->info[].codepoint`, dedupes, sends back |
 | `signatures.json` | Per-build offsets, build-id, known anchors |
 | `pyproject.toml` | `uv sync` then `uv run python run.py` |
-| `tools/find_xref.py` | Self-configuring `.text` scanner for RIP-relative LEA refs to a target VA |
+| `tools/find_xref.py` | Self-configuring `.text` scanner for RIP-relative LEA refs to a target VA (Binja-free xref-to-data) |
+| `tools/find_callers.py` | Self-configuring `.text` scanner for direct `CALL`/`JMP` rel32 sites to a target VA (Binja-free xref-to-function) |
 | `tools/find_hb_buffer_add.py` | Abandoned wildcard-prologue scan, kept for reference |
 
 ## Troubleshooting

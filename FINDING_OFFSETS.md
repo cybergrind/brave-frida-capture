@@ -30,14 +30,29 @@ changes" below.
 
 ## Prerequisites
 
-| Tool | Notes |
-| --- | --- |
-| **Binary Ninja** | Commercial edition (Personal forbids the plugin model BinAssist uses). Open `/opt/brave-bin/brave` and let analysis start — it doesn't have to be complete; we force it on demand below. The analysis DB in MCP is typically named `brave.bndb`; confirm with `mcp__binassist__list_binaries`. |
-| **BinAssist MCP plugin** | Reachable at `http://localhost:8000/mcp`. `curl -X POST -H "Accept: application/json, text/event-stream" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' http://localhost:8000/mcp` should return 200 in under 1s. Registered in `~/.claude.json` as `binassist`. **If you restart the MCP server, run `/mcp` in Claude Code to reconnect** — the old session ID is otherwise invalid and calls return `Bad Request: No valid session ID provided`. |
-| **objdump, readelf** | binutils. Used for everything outside Binja so we don't depend on it being responsive. |
-| **python3** | stdlib only — `tools/find_xref.py` uses no third-party libs. |
-| **Chromium source checkout** | Anywhere on disk — we cite paths under `third_party/harfbuzz-ng/src/src/` to interpret disassembly. If you don't have one, [browse vendored HarfBuzz on GitHub](https://github.com/harfbuzz/harfbuzz/tree/main/src) at the matching version. |
-| **uv** | Only needed for the final end-to-end verification (`uvx --from frida-tools python run.py`). |
+**Two paths through this workflow:** the steps below are written assuming
+Binary Ninja + BinAssist MCP, because that's the original tooling. You can
+also run the whole thing with just **objdump, readelf, and the two scripts
+in `tools/`** — that path is called out inline as "**No-Binja:**" boxes
+under each affected step. The fingerprint heuristics, fallback anchors,
+and end-to-end verification are identical either way.
+
+| Tool | Required? | Notes |
+| --- | --- | --- |
+| **objdump, readelf** | yes | binutils. Used for everything outside Binja so we don't depend on it being responsive. |
+| **python3** | yes | stdlib only — `tools/find_xref.py` and `tools/find_callers.py` use no third-party libs. |
+| **Chromium source checkout** | yes | Anywhere on disk — we cite paths under `third_party/harfbuzz-ng/src/src/` to interpret disassembly. If you don't have one, [browse vendored HarfBuzz on GitHub](https://github.com/harfbuzz/harfbuzz/tree/main/src) at the matching version. |
+| **uv** | yes | Only needed for the final end-to-end verification (`uvx --from frida-tools python run.py`). |
+| **Binary Ninja** | optional | Commercial edition (Personal forbids the plugin model BinAssist uses). Open `/opt/brave-bin/brave` and let analysis start — it doesn't have to be complete; we force it on demand below. The analysis DB in MCP is typically named `brave.bndb`; confirm with `mcp__binassist__list_binaries`. Skip if you're using the No-Binja path. |
+| **BinAssist MCP plugin** | optional | Only needed with Binja. Reachable at `http://localhost:8000/mcp`. `curl -X POST -H "Accept: application/json, text/event-stream" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' http://localhost:8000/mcp` should return 200 in under 1s. Registered in `~/.claude.json` as `binassist`. **If you restart the MCP server, run `/mcp` in Claude Code to reconnect** — the old session ID is otherwise invalid and calls return `Bad Request: No valid session ID provided`. |
+
+`tools/`:
+- `find_xref.py <va>` — scans `.text` for RIP-relative `LEA` instructions
+  pointing at `<va>`. Use to xref *to a string or data symbol*. Self-configures
+  from PT_LOAD; no per-build constants.
+- `find_callers.py <va>` — scans `.text` for direct `CALL` (and optionally
+  `JMP`) sites whose rel32 target equals `<va>`. Use to xref *to a function
+  start* — i.e. as a Binja-free substitute for `xrefs(direction='to')`.
 
 The workflow assumes Brave is the Linux x86-64 Arch `brave-bin` package at
 `/opt/brave-bin/brave`. For other distros / install methods (Flatpak, Snap,
@@ -103,20 +118,25 @@ exactly one place in HarfBuzz: the lazy initializer
 `third_party/harfbuzz-ng/src/src/hb-shaper.cc` (around line 48). It's a
 stable, well-known anchor that has survived every HarfBuzz refactor.
 
-```text
-mcp__binassist__search_strings(filename="brave.bndb", pattern="HB_SHAPER_LIST")
-```
-
-Note Binja's reported address; the real VA is that minus your skew. Cross-check:
+**No-Binja path** (also the cross-check for Binja users):
 
 ```bash
 strings -t x /opt/brave-bin/brave | grep -F 'HB_SHAPER_LIST'
+# → e.g. "1f22292 HB_SHAPER_LIST" — that hex is the real VA.
 ```
 
 (`HB_SHAPER_LIST` lives in `.rodata`, which is in the *first* PT_LOAD where
 `p_offset == p_vaddr`, so strings(1)'s file offset equals the real VA.)
 
-If `search_strings` returns nothing, see "Fallback anchors" below.
+**Via Binja MCP:**
+
+```text
+mcp__binassist__search_strings(filename="brave.bndb", pattern="HB_SHAPER_LIST")
+```
+
+Note Binja's reported address; the real VA is that minus your skew.
+
+If neither route returns a hit, see "Fallback anchors" below.
 
 ### Step 3 — find the lazy-loader function (the seed function)
 
@@ -126,7 +146,17 @@ address into `%rdi` before `call getenv@plt`. The enclosing function is
 shapers loader. (Older HarfBuzz had a separate `hb_options_init` function;
 that's gone. Don't expect to find a symbol by that name.)
 
-Via MCP, using Binja-space addresses:
+**No-Binja path** (also more reliable than Binja when its analysis is
+still mid-flight): scan `.text` for the LEA that loads the string's
+address. The scanner reads `.text` bounds from the ELF, so no per-build
+constants:
+
+```bash
+python3 tools/find_xref.py 0x<real_VA_of_HB_SHAPER_LIST>
+# → prints each matching LEA's real VA; expect exactly 1 hit
+```
+
+**Via Binja MCP** (Binja-space addresses):
 
 ```text
 mcp__binassist__xrefs(filename="brave.bndb",
@@ -138,15 +168,9 @@ mcp__binassist__get_parent_function(filename="brave.bndb",
 # → records the function start in Binja-space
 ```
 
-**If Binja's analysis hasn't reached that region yet**, the xref may
-report `function: null` and `get_parent_function` may time out. Sidestep
-with our scanner (it reads `.text` bounds from the ELF, so no
-per-build constants):
-
-```bash
-python3 tools/find_xref.py 0x<real_VA_of_HB_SHAPER_LIST>
-# → prints each matching LEA's real VA; expect exactly 1 hit
-```
+(If Binja reports `function: null` or `get_parent_function` times out
+because analysis hasn't reached that region, fall back to `find_xref.py`
+above — that's why we keep it.)
 
 If you get **2+ hits**: re-check you used the real VA (not Binja-space);
 disassemble each hit and pick the one whose enclosing function calls
@@ -161,7 +185,11 @@ Find the function start by scanning backward from the hit for the prologue
 
 ```bash
 HIT=0x<hit_va>
-objdump -d --start-address=$((HIT - 0x300)) --stop-address=$((HIT + 0x40)) /opt/brave-bin/brave
+objdump -d --start-address=$((HIT - 0x800)) --stop-address=$((HIT + 0x40)) /opt/brave-bin/brave \
+  | grep -B1 -E '^\s*[0-9a-f]+:\s+cc\s+' | tail -20
+# The first instruction *after* the trailing `cc` run is the function start.
+# Cross-check that it's a `push %rbp` or `endbr64; push %rbp` prologue:
+objdump -d --start-address=0x<candidate_start> --stop-address=0x<candidate_start+0x20> /opt/brave-bin/brave
 ```
 
 Look for the most recent `push %rbp` / `mov %rsp,%rbp` after a run of `cc`
@@ -182,7 +210,10 @@ call strncmp@plt
 If those calls aren't there in roughly that order, you didn't find the
 right function.
 
-Rename it in Binja:
+Record the function's real VA — Step 4 needs it.
+
+**Binja users:** rename it for convenience (lets Step 4 use the name in
+xref queries instead of the Binja-space address):
 
 ```text
 mcp__binassist__rename_symbol(filename="brave.bndb",
@@ -190,9 +221,8 @@ mcp__binassist__rename_symbol(filename="brave.bndb",
                                new_name="hb_shapers_lazy_loader_create")
 ```
 
-(Renaming is **required** because Step 4 uses `address_or_name="hb_shapers_lazy_loader_create"`
-for the xref query. If you skip the rename, pass the Binja-space address
-directly.)
+(Renaming is optional. If you skip it, pass the Binja-space address
+directly in Step 4's xref query.)
 
 ### Step 4 — find `hb_shape_full`
 
@@ -202,15 +232,34 @@ two principal callers are HarfBuzz's main shape entries: `hb_shape_full`
 both of which fetch the shaper list via `_hb_shapers_get()` which lazily
 calls our seed function.
 
+**No-Binja path:** scan `.text` for direct `CALL` instructions whose
+rel32 target equals `hb_shapers_lazy_loader_create`'s real VA:
+
+```bash
+python3 tools/find_callers.py 0x<lazy_loader_real_va>
+# Typically 2 hits, both in HarfBuzz's own .text region.
+# Each printed VA is the call-site, not the enclosing function start —
+# walk backward the same way Step 3 did:
+HIT=0x<call_site_va>
+objdump -d --start-address=$((HIT - 0x800)) --stop-address=$((HIT + 0x40)) /opt/brave-bin/brave \
+  | grep -B1 -E '^\s*[0-9a-f]+:\s+cc\s+' | tail -20
+# First instruction after the trailing `cc` run = parent function's start.
+```
+
+If `find_callers.py` shows 0 or 1 hits, retry with `--include-jmp` — clang
+sometimes emits a tail-call `JMP rel32` for one of the two callers.
+
+**Via Binja MCP** (Binja-space addresses):
+
 ```text
 mcp__binassist__xrefs(filename="brave.bndb",
                        address_or_name="hb_shapers_lazy_loader_create",
                        direction="to")
-# Typically 2 hits, both in HarfBuzz's own .text region.
+# Typically 2 hits. Each has a `function` field with the enclosing function's
+# start address in Binja-space — convert back to real VA by subtracting skew.
 ```
 
-For each hit, get its parent function and inspect with objdump (convert
-Binja addresses back to real VAs):
+For each candidate parent function, inspect the prologue with objdump:
 
 ```bash
 START=0x<parent_func_real_va>
@@ -235,7 +284,15 @@ shape plans, not buffers. Use the `+0x60` read as the disambiguator.
 and the scratch-clear but takes only 4 args (no `r8`), that's the fused
 version — still a valid hook target.
 
-Sanity-check by listing the function's own callers:
+Sanity-check by listing the function's own callers.
+
+**No-Binja path:**
+
+```bash
+python3 tools/find_callers.py 0x<candidate_func_real_va>
+```
+
+**Via Binja MCP:**
 
 ```text
 mcp__binassist__xrefs(filename="brave.bndb",
@@ -243,16 +300,18 @@ mcp__binassist__xrefs(filename="brave.bndb",
                        direction="to")
 ```
 
-You should see a handful of HarfBuzz-internal callers (real VAs in the
-same neighbourhood as `hb_shape_full` itself) **plus** 2–4 callers in
-completely different regions of `.text` (Blink and ui/gfx). No "far"
-callers → wrong function (probably `_hb_buffer_t::enter()` or
+Either way you should see a handful of HarfBuzz-internal callers (real
+VAs in the same neighbourhood as `hb_shape_full` itself) **plus** 2–4
+callers in completely different regions of `.text` (Blink and ui/gfx).
+No "far" callers → wrong function (probably `_hb_buffer_t::enter()` or
 `hb_shape_plan_create2`). Don't assume any particular numeric range for
 "far" — Blink and HarfBuzz happen to sit far apart in *this* build, but
-that's a layout artifact; the **distinction** that matters is "callers in
-the same static-link cluster vs. callers in a totally different region".
+that's a layout artifact; the **distinction** that matters is "callers
+in the same static-link cluster vs. callers in a totally different
+region".
 
-Rename, record the **real VA** as `signatures.json:offsets.hb_shape_full`.
+Record the **real VA** as `signatures.json:offsets.hb_shape_full`.
+(Binja users: optionally rename for clarity in future sessions.)
 
 ### Step 5 — find `hb_buffer_add_utf16` (optional, sanity anchor only)
 
@@ -261,12 +320,23 @@ again — `hb_shape_full` is the only address `capture.js` actually uses.
 We keep `hb_buffer_add_utf16` in `signatures.json` as a cross-check.
 
 Pick a *far* caller of `hb_shape_full` from Step 4's xrefs (one that
-lives outside the HarfBuzz cluster — Blink). Disassemble its containing
-function and list every `call`:
+lives outside the HarfBuzz cluster — Blink). Each xref VA is a call-site,
+not a function start; resolve it back to its enclosing function the same
+way Step 3/4 did (walk backward to the last `cc`-padding run):
+
+```bash
+HIT=0x<blink_call_site_va>
+objdump -d --start-address=$((HIT - 0x1000)) --stop-address=$((HIT + 0x40)) /opt/brave-bin/brave \
+  | grep -B1 -E '^\s*[0-9a-f]+:\s+cc\s+' | tail -20
+# First instruction after the trailing `cc` = Blink caller function start.
+```
+
+Then list every `call` in that function (use a generous size; Blink
+shapers are several KB):
 
 ```bash
 START=0x<blink_caller_func_real_va>
-END=0x<blink_caller_func_real_va_plus_size>
+END=$((START + 0x2000))
 objdump -d --start-address=$START --stop-address=$END /opt/brave-bin/brave \
   | grep -E '^\s+[0-9a-f]+:.*\tcall\s'
 ```
@@ -510,7 +580,7 @@ and reads codepoints from `buffer->info[].codepoint`.
 Binja's Python GIL is held by analysis. Either:
 
 - Cancel analysis in Binja (Esc or Tools → Cancel All Background Tasks).
-- Use objdump and `tools/find_xref.py` for everything until analysis settles — neither depends on Binja being responsive.
+- Use objdump, `tools/find_xref.py`, and `tools/find_callers.py` for everything until analysis settles — none of these depend on Binja being responsive. The "No-Binja path" boxes under each step cover the same operations.
 - If the MCP **server** is unresponsive (not just slow), restart the BinAssist plugin on the Binja side, then in Claude Code run `/mcp` to reconnect.
 
 ## Reference: end-to-end working example

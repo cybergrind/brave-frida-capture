@@ -168,7 +168,8 @@ upgrades and the build-id in `signatures.json` no longer matches.
 
 Helper scripts under `tools/`:
 
-- `find_xref.py <hex_target_va> [path/to/binary]` — scans the binary's first executable PT_LOAD segment for 7-byte RIP-relative `LEA` instructions whose disp resolves to the target VA. Reads PT_LOAD bounds dynamically (no per-build constants), so it works across Brave updates without changes.
+- `find_xref.py <hex_target_va> [path/to/binary]` — scans the binary's first executable PT_LOAD segment for 7-byte RIP-relative `LEA` instructions whose disp resolves to the target VA. Use to xref *to a string or data symbol* (Binja-free substitute for `xrefs(direction='to')` on data). Reads PT_LOAD bounds dynamically (no per-build constants), so it works across Brave updates without changes.
+- `find_callers.py <hex_target_va> [path/to/binary] [--include-jmp]` — companion scanner for direct `CALL rel32` (and optionally `JMP rel32`) sites whose target equals the given VA. Use to xref *to a function start* (Binja-free substitute for `xrefs(direction='to')` on a function). Same PT_LOAD self-configuration as `find_xref.py`. Together with `find_xref.py` and objdump, this makes the full offset-refresh workflow runnable without Binja — see FINDING_OFFSETS.md.
 - `find_hb_buffer_add.py` — abandoned wildcard-prologue scan. Kept for reference; not on the refresh path (it relied on system libharfbuzz 14.2.0 as a byte-template, which doesn't match chromium-vendored 13.1.0). The MCP-driven xref-chain in FINDING_OFFSETS.md replaced it.
 
 ## Buffer layout `capture.js` depends on (HarfBuzz 13.1.0, x86-64)
