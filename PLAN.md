@@ -126,10 +126,9 @@ Responsibilities of `run.py`:
 - Load `capture.js`, send `{type:"signatures", offsets:{...}}` via
   `script.post(...)`, then `resume()` the spawned process.
 - Pump messages: print `{type:"text"}` payloads as `[pid N] <text>`.
-- Use `uvx --from frida-tools` — but actually `frida-tools` ships
-  `frida-python` too, so the cleanest approach is for `run.py` to be invoked
-  via `uvx --from frida-tools --with frida python run.py`. Test what the host
-  actually has first; document in README.
+- Now that `pyproject.toml` declares `frida-tools` as a dependency, invoke
+  via `uv run python run.py` (uses the synced `.venv`, no ephemeral resolve
+  per invocation).
 
 ### Phase 3 — `capture.js` Frida agent
 

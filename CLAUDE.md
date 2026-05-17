@@ -104,12 +104,12 @@ SystemV AMD64 calling convention puts `buffer` in `rdi`, `text` in `rsi`,
 | What | Where |
 | --- | --- |
 | Frida core | https://github.com/frida/frida |
-| frida-tools (CLI, what `uvx` runs) | https://github.com/frida/frida-tools |
+| frida-tools (CLI, installed via `uv sync`) | https://github.com/frida/frida-tools |
 | `frida-python` API | https://github.com/frida/frida-python |
 | Gum JavaScript API docs | https://frida.re/docs/javascript-api/ |
 | Module / Memory / Interceptor docs | https://frida.re/docs/javascript-api/#module , `#memory`, `#interceptor` |
 | Child gating notes | https://frida.re/news/2018/03/27/frida-10-7-released/ |
-| Invocation: `uvx --from frida-tools frida ...` (v17.9.10 confirmed) | local |
+| Invocation: `uv run frida ...` (v17.9.10 confirmed) | local |
 
 ### Binary Ninja MCP (used to find offsets in the stripped binary)
 

@@ -28,8 +28,8 @@ codepoints. Hooking `hb_shape_full` catches both paths from a single point.
 - Linux x86-64
 - Brave installed at `/opt/brave-bin/brave` (Arch `brave-bin` package). Other
   paths work with `--brave /path/to/brave`.
-- [`uv`](https://github.com/astral-sh/uv) (provides `uvx`, which manages the
-  ephemeral frida-tools environment).
+- [`uv`](https://github.com/astral-sh/uv); `uv sync` to install the
+  frida-tools environment declared in `pyproject.toml`.
 - `~/.config/BraveSoftware/brave-frida/` will be created on first run. The
   profile **persists across runs**.
 - A `signatures.json` with non-null offsets for `hb_buffer_add_utf16` (see
@@ -39,7 +39,7 @@ codepoints. Hooking `hb_shape_full` catches both paths from a single point.
 
 ```bash
 cd ~/devel/opensource/brave-frida-capture
-uvx --from frida-tools python run.py
+uv run python run.py
 ```
 
 Output on stdout is one captured string per line:
@@ -55,7 +55,7 @@ Frida bookkeeping (process attach, hook installation, errors) goes to stderr.
 Pass extra args through to Brave after `--`:
 
 ```bash
-uvx --from frida-tools python run.py -- https://en.wikipedia.org/wiki/HarfBuzz
+uv run python run.py -- https://en.wikipedia.org/wiki/HarfBuzz
 ```
 
 Stop with `Ctrl-C`. The Brave subprocess is killed; the profile stays.

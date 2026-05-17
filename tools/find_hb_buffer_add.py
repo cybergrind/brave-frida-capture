@@ -11,29 +11,33 @@ Invariants we look for (extracted from system libharfbuzz):
 
 Reorders are common; we accept both "len-first" and "succ-first" patterns.
 """
-import mmap, re, sys
 
-BRAVE = "/opt/brave-bin/brave"
-TEXT_VA   = 0x0322b000
-TEXT_OFF  = 0x0322a000
-TEXT_SIZE = 0x0dbcd615
+import mmap
+import sys
 
-PROLOGUE = bytes.fromhex("554889e54157415641554154534883ec")  # ends right before imm8
+
+BRAVE = '/opt/brave-bin/brave'
+TEXT_VA = 0x0322B000
+TEXT_OFF = 0x0322A000
+TEXT_SIZE = 0x0DBCD615
+
+PROLOGUE = bytes.fromhex('554889e54157415641554154534883ec')  # ends right before imm8
 
 # After prologue + 1 byte (stack adj imm8), look for:
 #   succ check then len read, OR len read then succ check, within next ~80 bytes
 #   buffer at +0x20 (len): 8b 47 20
 #   buffer at +0x4  (succ): 0f b6 47 04 84 c0 0f 84
-LEN_READ  = bytes.fromhex("8b4720")
-SUCC_READ = bytes.fromhex("0fb647048c0".rstrip("0"))  # placeholder
-SUCC_READ_FULL = bytes.fromhex("0fb64704") + bytes.fromhex("84c0") + bytes.fromhex("0f84")
+LEN_READ = bytes.fromhex('8b4720')
+SUCC_READ = bytes.fromhex('0fb647048c0'.rstrip('0'))  # placeholder
+SUCC_READ_FULL = bytes.fromhex('0fb64704') + bytes.fromhex('84c0') + bytes.fromhex('0f84')
+
 
 def main():
-    with open(BRAVE, "rb") as f:
+    with open(BRAVE, 'rb') as f:
         mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
-    text = mm[TEXT_OFF:TEXT_OFF + TEXT_SIZE]
+    text = mm[TEXT_OFF : TEXT_OFF + TEXT_SIZE]
 
-    print(f"Searching {len(text)/1e6:.1f} MB of .text for prologue...", file=sys.stderr)
+    print(f'Searching {len(text) / 1e6:.1f} MB of .text for prologue...', file=sys.stderr)
     hits = []
     start = 0
     pcount = 0
@@ -45,16 +49,17 @@ def main():
         # window of bytes after prologue+stack_adj_byte
         window = text[idx + len(PROLOGUE) + 1 : idx + len(PROLOGUE) + 1 + 80]
         has_succ = SUCC_READ_FULL in window
-        has_len  = LEN_READ in window
+        has_len = LEN_READ in window
         if has_succ and has_len:
             va = TEXT_VA + idx
             hits.append(va)
         start = idx + 1
 
-    print(f"prologue matches: {pcount}", file=sys.stderr)
-    print(f"prologue + succ + len matches: {len(hits)}", file=sys.stderr)
+    print(f'prologue matches: {pcount}', file=sys.stderr)
+    print(f'prologue + succ + len matches: {len(hits)}', file=sys.stderr)
     for h in hits:
-        print(f"0x{h:x}")
+        print(f'0x{h:x}')
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
