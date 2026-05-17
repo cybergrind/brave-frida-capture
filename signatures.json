@@ -1,0 +1,15 @@
+{
+  "_comment": "Virtual addresses (= file offsets for the .text region, modulo the 0x1000 PT_LOAD page-alignment skew) of HarfBuzz functions in the brave binary. Frida applies these as Module.findBaseAddress('brave') + offset. To refresh after a Brave update, see PLAN.md Phase 1.",
+  "brave_binary": "/opt/brave-bin/brave",
+  "brave_build_id": "d6091daa9f05eabe47eb1dcbe13ba40babb32521",
+  "brave_package_version": "1.89.145-1",
+  "offsets": {
+    "hb_buffer_add_utf16": "0x44bec70",
+    "hb_shape_full": "0x44c9070"
+  },
+  "known_anchors": {
+    "HB_SHAPER_LIST_string_va": "0x1f22292",
+    "hb_options_init_va": "0x69df290",
+    "binja_address_skew": "0x400000"
+  }
+}
