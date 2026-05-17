@@ -67,7 +67,7 @@ build. It looks like:
 
 ```json
 {
-  "brave_build_id": "d6091daa9f05eabe47eb1dcbe13ba40babb32521",
+  "brave_build_id": "854f18fa8a6a6c3423a075465cb199930811a7e6",
   "offsets": {
     "hb_buffer_add_utf16": "0x...",
     "hb_shape_full": "0x..."

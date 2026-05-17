@@ -42,7 +42,7 @@ and end-to-end verification are identical either way.
 | **objdump, readelf** | yes | binutils. Used for everything outside Binja so we don't depend on it being responsive. |
 | **python3** | yes | stdlib only — `tools/find_xref.py` and `tools/find_callers.py` use no third-party libs. |
 | **Chromium source checkout** | yes | Anywhere on disk — we cite paths under `third_party/harfbuzz-ng/src/src/` to interpret disassembly. If you don't have one, [browse vendored HarfBuzz on GitHub](https://github.com/harfbuzz/harfbuzz/tree/main/src) at the matching version. |
-| **uv** | yes | Only needed for the final end-to-end verification (`uvx --from frida-tools python run.py`). |
+| **uv** | yes | Only needed for the final end-to-end verification. Use `uv run python run.py` — **not** `uvx --from frida-tools python run.py`; the latter ignores this project's `requires-python = '>=3.14'` and resolves to an older Python that can't parse `run.py`'s PEP 758 `except` syntax. |
 | **Binary Ninja** | optional | Commercial edition (Personal forbids the plugin model BinAssist uses). Open `/opt/brave-bin/brave` and let analysis start — it doesn't have to be complete; we force it on demand below. The analysis DB in MCP is typically named `brave.bndb`; confirm with `mcp__binassist__list_binaries`. Skip if you're using the No-Binja path. |
 | **BinAssist MCP plugin** | optional | Only needed with Binja. Reachable at `http://localhost:8000/mcp`. `curl -X POST -H "Accept: application/json, text/event-stream" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' http://localhost:8000/mcp` should return 200 in under 1s. Registered in `~/.claude.json` as `binassist`. **If you restart the MCP server, run `/mcp` in Claude Code to reconnect** — the old session ID is otherwise invalid and calls return `Bad Request: No valid session ID provided`. |
 
@@ -367,23 +367,24 @@ Rename, record the real VA.
 
 ### Step 6 — update signatures.json
 
-`signatures.json` has a `_comment` field and a `known_anchors` block —
-preserve them. Edit in place; here's the schema with everything filled in:
+Edit `signatures.json` in place. Only `offsets.hb_shape_full` is read at
+runtime; everything else is documentation. Schema (omit any `known_anchors`
+entry you didn't capture — they're informational, not required):
 
 ```json
 {
-  "_comment": "<keep the existing comment text>",
+  "_comment": "<keep / refresh comment if stale; pointer to FINDING_OFFSETS.md is canonical>",
   "brave_binary": "/opt/brave-bin/brave",
   "brave_build_id": "<paste from readelf -n>",
   "brave_package_version": "<pacman -Q brave-bin / dpkg -l / flatpak info ...>",
   "offsets": {
-    "hb_buffer_add_utf16": "0x<real VA from Step 5; null if you skipped it>",
+    "hb_buffer_add_utf16": "0x<real VA from Step 5; omit if skipped>",
     "hb_shape_full":       "0x<real VA from Step 4>"
   },
   "known_anchors": {
     "HB_SHAPER_LIST_string_va":      "0x<real VA from Step 2>",
     "hb_shapers_lazy_loader_create": "0x<real VA from Step 3>",
-    "binja_address_skew":            "0x<your measured skew>"
+    "binja_address_skew":            "0x<your measured skew — omit on No-Binja path>"
   }
 }
 ```
@@ -392,14 +393,24 @@ preserve them. Edit in place; here's the schema with everything filled in:
 
 ```bash
 cd ~/devel/opensource/brave-frida-capture
-uvx --from frida-tools python run.py -- --new-window https://en.wikipedia.org/wiki/HarfBuzz
+# Pre-flight: catch any syntax error in run.py before launching Brave.
+uv run python -m py_compile run.py
+# End-to-end run (use timeout to cap; exit 124 = our timeout firing, not a failure):
+timeout 50 uv run python run.py -- --new-window https://en.wikipedia.org/wiki/HarfBuzz
 ```
+
+**Use `uv run`, not `uvx --from frida-tools`.** `uvx` runs in the
+frida-tools tool environment, whose Python may not satisfy this project's
+`requires-python` pin (currently `>=3.14`) — `run.py` uses PEP 758
+unparenthesized `except` syntax that Python 3.13 rejects with
+`SyntaxError`. `uv run` uses our `.venv`, which has the right Python.
 
 What to expect within ~30 seconds:
 
 1. stderr: `launching brave (subprocess, no Frida hold)` then `[parent <pid>] brave running`.
 2. stderr: `[poll-attach <pid>] renderer detected` plus `[pid <pid>] hooked: {"name":"hb_shape_full",...}` for each renderer that spawns.
-3. stdout: lines like `[pid N] From Wikipedia, the free encyclopedia`, `[pid N] Apple Advanced Typography shaping,`, `[pid N] 14.2.0` — **actual text painted on the page.**
+3. stderr (one-shot per renderer): `[pid <pid>] msg: {'type': 'dump', 'len': <n>, 'info0_hex': '<4 bytes of codepoint> ...'}` — `capture.js` emits a single layout-health dump per process. The first 4 bytes of `info0_hex` as LE uint32 must decode to a reasonable Unicode codepoint (e.g. `53 00 00 00` = `'S'`, `50 00 00 00` = `'P'`). If it doesn't, see "Hook fires but output is garbage" below.
+4. stdout: lines like `[pid N] From Wikipedia, the free encyclopedia`, `[pid N] Apple Advanced Typography shaping,` — **actual text painted on the page.** A healthy Wikipedia run captures ~1400+ lines.
 
 Diagnostic table:
 
@@ -583,23 +594,44 @@ Binja's Python GIL is held by analysis. Either:
 - Use objdump, `tools/find_xref.py`, and `tools/find_callers.py` for everything until analysis settles — none of these depend on Binja being responsive. The "No-Binja path" boxes under each step cover the same operations.
 - If the MCP **server** is unresponsive (not just slow), restart the BinAssist plugin on the Binja side, then in Claude Code run `/mcp` to reconnect.
 
-## Reference: end-to-end working example
+## Reference: two end-to-end working examples
 
-For Brave `1.89.145-1` (build-id `d6091daa9f05eabe47eb1dcbe13ba40babb32521`):
+Two builds shown side-by-side so future agents can see how VAs move while
+the fingerprints don't. Current authoritative values live in
+[CLAUDE.md § Confirmed anchors](./CLAUDE.md#confirmed-anchors-real-vas-for-brave-190122-1)
+and `signatures.json`; the tables below are historical reference.
 
-| symbol | real VA (= file offset for .rodata; .text VA for .text) | how recognised |
+### Brave 1.89.145-1 (build-id `d6091daa…`) — Binja-MCP path
+
+| symbol | real VA | how recognised |
 | --- | --- | --- |
 | `HB_SHAPER_LIST` string | `0x1f22292` | only LEA xref at `0x69df2ae` |
 | `hb_shapers_lazy_loader_create` | `0x69df290` | calls `getenv("HB_SHAPER_LIST")` + comma-token parser (`strchr`/`strlen`/`strncmp`) |
 | `hb_shape_full` | `0x44c9070` | 5-arg; `mov 0x60(%rsi),%eax; test;je`; then `movw $0,0xd0(%rsi)` + `movl $0,0xd8(%rsi)` |
 | `hb_buffer_add_utf16` | `0x44bec70` | 5-arg; reads `0x4(%rdi)` byte (writable check); two `cmp $0xffffffff` sentinels on edx/r8d; `lea (%rsi,%rax,2)` |
 
-Binja MCP address skew for this database: `0x400000` (measured per the
-"Critical concept" section above, not assumed).
+`.text` VA `0x322b000`. Binja MCP address skew: `0x400000` (measured).
+Wikipedia verification captured 482 unique lines.
 
-Buffer field offsets used by `capture.js`: `len` at `+0x60`, `info` at
-`+0x70`, `hb_glyph_info_t` stride 20 B, `.codepoint` at offset 0.
+### Brave 1.90.122-1 (build-id `854f18fa…`) — No-Binja path
 
-Wikipedia verification (`--new-window https://en.wikipedia.org/wiki/HarfBuzz`)
-captured 482 unique lines — infobox values (`14.2.0`), sidebar links,
-body paragraphs, citation entries — all matching visible page content.
+| symbol | real VA | how recognised |
+| --- | --- | --- |
+| `HB_SHAPER_LIST` string | `0x1e88556` | `strings -t x \| grep`, 1 hit |
+| `hb_shapers_lazy_loader_create` | `0x69c6000` | `find_xref.py 0x1e88556` → 1 hit at `0x69c601e`; walked back over `cc` padding to prologue; calls `getenv@plt` then `__libc_memalign+0x10` (the hb_calloc shim) then `strchr`/`strlen`/`strncmp` |
+| `hb_shape_full` | `0x46876c0` | `find_callers.py 0x69c6000` → 2 hits (`0x4687e2e`, `0x46943c1`). Candidate 1 prologue: 5-arg, `sub $0xb8,%rsp`, `mov 0x60(%rsi),%eax;test;je`, `movw $0,0xd0(%rsi)` + `movl $0,0xd8(%rsi)`. Candidate 2 was `hb_shape_plan_create2` (LEA + test rsi, no `+0x60` read) |
+| `hb_buffer_add_utf16` | `0x4682850` | `find_callers.py 0x46876c0` → 4 hits (2 internal, 2 far). Walked back from far hit `0xe0f04e2` to Blink caller `0xe0f0380`. Call at `0xe0f0483` targets `0x4682850`; fingerprint matched: `+0x4` writable check, `cmp $-1` on edx and r8d, `lea (%rsi,%rax,2)`, `movzwl` reads |
+
+`.text` VA `0x3222000` (note: **shifted from `0x322b000`** in prior build —
+absolute numbers are not stable across releases; only the fingerprints
+are). No Binja used → no skew.
+
+Buffer field offsets in `capture.js` were **unchanged**: `len` at `+0x60`,
+`info` at `+0x70`, `hb_glyph_info_t` stride 20 B, `.codepoint` at offset 0.
+The one-shot dump from `capture.js` confirmed `info0_hex` starts
+`53 00 00 00` (`'S'`) — visible on Wikipedia's "Search" button.
+
+Wikipedia verification: ~1400 unique lines, including page body
+("`shaper handles the majority of scripts`", "`Apple Advanced
+Typography`", "`GNOME libraries`"), nav (Search, Donate, Log in), and
+sidebar metadata — all matching visible content.

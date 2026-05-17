@@ -56,7 +56,7 @@ brave-frida-capture/
 | Brave Core (this user's checkout) | `/home/kpi/devel/opensource/brave-core` |
 | Brave Core upstream | https://github.com/brave/brave-core |
 | Brave Browser (umbrella, build scripts) | https://github.com/brave/brave-browser |
-| Installed binary under test | `/opt/brave-bin/brave` (Arch `brave-bin` 1:1.89.145-1) |
+| Installed binary under test | `/opt/brave-bin/brave` (Arch `brave-bin` 1:1.90.122-1) |
 | Launcher script (passes `brave-flags.conf`) | `/usr/bin/brave` |
 | User profile we use | `~/.config/BraveSoftware/brave-frida/` |
 
@@ -141,25 +141,30 @@ SystemV AMD64 calling convention puts `buffer` in `rdi`, `text` in `rsi`,
 - **Sandbox flag is non-negotiable** for the PoC: Frida cannot attach to a
   sandboxed renderer. Document this loudly, never silently drop it.
 - **Stripped binary realities:** every `hb_*` symbol we hook must be found by
-  offset, not name. When Brave updates, signatures break — see PLAN.md for the
-  refresh workflow.
+  offset, not name. When Brave updates, signatures break — see
+  [FINDING_OFFSETS.md](./FINDING_OFFSETS.md) for the refresh workflow.
+- **Python 3.14 required.** `pyproject.toml` pins `requires-python='>=3.14'`
+  and `run.py` uses PEP 758 unparenthesized `except` syntax. Always run via
+  `uv run python run.py` (uses the project venv) — `uvx --from frida-tools
+  python run.py` resolves to a different Python and fails with a
+  `SyntaxError` on the `except` clause.
 
 ## Quick references
 
-- Brave version test was developed against: `1.89.145-1` (brave-bin Arch package)
-- Chromium HarfBuzz revision: `5d4e96ad` / v13.1.0-26
-- BuildID of `/opt/brave-bin/brave`: `d6091daa9f05eabe47eb1dcbe13ba40babb32521`
+- Brave version currently pinned: `1.90.122-1` (brave-bin Arch package)
+- Chromium HarfBuzz revision (from local checkout): `5d4e96ad` / v13.1.0-26 — may lag the actual revision in 1.90.122; the end-to-end Wikipedia test is the ground truth for buffer-layout correctness.
+- BuildID of `/opt/brave-bin/brave`: `854f18fa8a6a6c3423a075465cb199930811a7e6`
   — use to confirm signatures still apply after upgrades.
 
-## Confirmed anchors (real VAs, for Brave 1.89.145-1)
+## Confirmed anchors (real VAs, for Brave 1.90.122-1)
 
 | Symbol | VA | Notes |
 | --- | --- | --- |
-| `HB_SHAPER_LIST` (string) | `0x1f22292` | length 14, in `.rodata` |
-| `hb_shapers_lazy_loader_create` | `0x69df290` | the lazy-init `create()` method of HarfBuzz's shapers loader (`third_party/harfbuzz-ng/src/src/hb-shaper.cc` around line 48). Only xref to `HB_SHAPER_LIST`. Verified by disassembly: calls `getenv("HB_SHAPER_LIST")`, allocates via `hb_calloc`, parses comma-separated tokens with `strchr`/`strlen`/`strncmp`. **Note:** this is NOT `hb_options_init` (a function name from older HarfBuzz that no longer exists in vendored 13.x). |
-| `hb_shape_full` | `0x44c9070` | reached via xref-walk from `hb_shapers_lazy_loader_create` (one of two callers). The function `capture.js` actually hooks. |
-| `hb_buffer_add_utf16` | `0x44bec70` | secondary anchor / sanity check. Found by walking from a Blink caller of `hb_shape_full`. |
-| `getenv@plt` | `0x10df8b30` | PLT trampoline reachable from `hb_shapers_lazy_loader_create + 0x25`. |
+| `HB_SHAPER_LIST` (string) | `0x1e88556` | length 14, in `.rodata` |
+| `hb_shapers_lazy_loader_create` | `0x69c6000` | the lazy-init `create()` method of HarfBuzz's shapers loader (`third_party/harfbuzz-ng/src/src/hb-shaper.cc` around line 48). Only xref to `HB_SHAPER_LIST`. Verified by disassembly: calls `getenv("HB_SHAPER_LIST")`, allocates via `hb_calloc`, parses comma-separated tokens with `strchr`/`strlen`/`strncmp`. **Note:** this is NOT `hb_options_init` (a function name from older HarfBuzz that no longer exists in vendored 13.x). |
+| `hb_shape_full` | `0x46876c0` | reached via `find_callers.py 0x69c6000` (one of two callers). The function `capture.js` actually hooks. |
+| `hb_buffer_add_utf16` | `0x4682850` | secondary anchor / sanity check. Found by walking from a Blink caller of `hb_shape_full` (at `0xe0f04e2`). |
+| `getenv@plt` | `0x11120920` | PLT trampoline reachable from `hb_shapers_lazy_loader_create + 0x25`. |
 
 The full step-by-step methodology — including how to identify these
 functions in a fresh Brave build — lives in
