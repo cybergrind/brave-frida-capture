@@ -31,16 +31,20 @@ runtime.
 Renderer processes are sandboxed; Frida can't attach. PoC launches Brave with
 `--no-sandbox`. Acceptable for a research tool, never for normal browsing.
 
-## Repository layout (target)
+## Repository layout
 
 ```
 brave-frida-capture/
-  CLAUDE.md          — this file
-  PLAN.md            — implementation plan, status, backlogs
-  run.py             — launcher: profile dir + spawn brave + frida attach + print
-  capture.js         — frida agent: hooks hb_buffer_add_utf16, sends text back
-  signatures.json    — { "hb_buffer_add_utf16": <file_offset_hex>, ... }
-  README.md          — user-facing run instructions (written last)
+  CLAUDE.md             — this file
+  PLAN.md               — design + as-built record
+  README.md             — user-facing run instructions
+  FINDING_OFFSETS.md    — refresh workflow when Brave updates (authoritative for that)
+  run.py                — launcher: subprocess Brave, poll /proc for renderers, Frida-attach each
+  capture.js            — Frida agent: hooks hb_shape_full, reads codepoints from buffer->info[]
+  signatures.json       — per-build offsets + build-id + known anchors
+  pyproject.toml        — `uv sync` then `uv run python run.py`
+  tools/find_xref.py    — self-configuring `.text` LEA-xref scanner
+  tools/find_hb_buffer_add.py — abandoned wildcard scan (kept for reference)
 ```
 
 ## Source repositories and key paths
@@ -119,8 +123,8 @@ SystemV AMD64 calling convention puts `buffer` in `rdi`, `text` in `rsi`,
 | Registered in this Claude as | `binassist` (user scope, in `~/.claude.json`) |
 | Binary Ninja product | https://binary.ninja/ |
 | Tool prefix used here | `mcp__binassist__*` (e.g. `search_strings`, `xrefs`, `get_code`) |
-| Currently loaded binary | `brave` → `/opt/brave-bin/brave` |
-| **Binja → real VA offset** | **Binja reports addresses with a +0x400000 analysis base.** Subtract 0x400000 from every address Binja returns to get the actual virtual address (matches both file offset and runtime VA, since the binary maps with `p_offset == p_vaddr` for the first PT_LOAD). Confirmed empirically and by user. |
+| Currently loaded binary | `brave.bndb` → `/opt/brave-bin/brave` |
+| **Binja → real VA offset** | Binja reports addresses in its own analysis-database space; for the current build, that's **`+0x400000`** above the real VA. This is **not universal** — measure first per [FINDING_OFFSETS.md § Critical concept](./FINDING_OFFSETS.md#critical-concept-binja-mcp-address-skew-measure-dont-assume) (compare `search_strings` for `HB_SHAPER_LIST` to `strings -t x`). Every Binja MCP return → subtract skew; every input → add skew. |
 
 ## Working agreements for future Claude sessions
 
@@ -147,43 +151,41 @@ SystemV AMD64 calling convention puts `buffer` in `rdi`, `text` in `rsi`,
 - BuildID of `/opt/brave-bin/brave`: `d6091daa9f05eabe47eb1dcbe13ba40babb32521`
   — use to confirm signatures still apply after upgrades.
 
-## Confirmed anchors (real VAs)
+## Confirmed anchors (real VAs, for Brave 1.89.145-1)
 
 | Symbol | VA | Notes |
 | --- | --- | --- |
 | `HB_SHAPER_LIST` (string) | `0x1f22292` | length 14, in `.rodata` |
-| `hb_options_init` | `0x69df290` | only xref to `HB_SHAPER_LIST`; verified by disassembly (calls `getenv("HB_SHAPER_LIST")`, parses comma-separated tokens with `strchr`/`strlen`) |
-| `getenv@plt` | `0x10df8b30` | from PLT trampoline reachable from `hb_options_init+0x25` |
+| `hb_shapers_lazy_loader_create` | `0x69df290` | the lazy-init `create()` method of HarfBuzz's shapers loader (`third_party/harfbuzz-ng/src/src/hb-shaper.cc` around line 48). Only xref to `HB_SHAPER_LIST`. Verified by disassembly: calls `getenv("HB_SHAPER_LIST")`, allocates via `hb_calloc`, parses comma-separated tokens with `strchr`/`strlen`/`strncmp`. **Note:** this is NOT `hb_options_init` (a function name from older HarfBuzz that no longer exists in vendored 13.x). |
+| `hb_shape_full` | `0x44c9070` | reached via xref-walk from `hb_shapers_lazy_loader_create` (one of two callers). The function `capture.js` actually hooks. |
+| `hb_buffer_add_utf16` | `0x44bec70` | secondary anchor / sanity check. Found by walking from a Blink caller of `hb_shape_full`. |
+| `getenv@plt` | `0x10df8b30` | PLT trampoline reachable from `hb_shapers_lazy_loader_create + 0x25`. |
+
+The full step-by-step methodology — including how to identify these
+functions in a fresh Brave build — lives in
+[FINDING_OFFSETS.md](./FINDING_OFFSETS.md). Read that whenever Brave
+upgrades and the build-id in `signatures.json` no longer matches.
 
 Helper scripts under `tools/`:
 
-- `find_xref.py <hex_target_va>` — scans `.text` for all 7-byte RIP-relative `LEA` instructions whose disp resolves to the target VA. Finds string xrefs in PIE binaries even when Binja analysis is incomplete.
-- `find_hb_buffer_add.py` — attempted wildcard prologue scan for `hb_buffer_add_utf16`/`utf8`. **Currently returns 0 hits.** Pattern needs revision (chromium 13.1.0's `hb_buffer_t` field layout differs from system 14.2.0; clang prologue choices differ from system gcc).
+- `find_xref.py <hex_target_va> [path/to/binary]` — scans the binary's first executable PT_LOAD segment for 7-byte RIP-relative `LEA` instructions whose disp resolves to the target VA. Reads PT_LOAD bounds dynamically (no per-build constants), so it works across Brave updates without changes.
+- `find_hb_buffer_add.py` — abandoned wildcard-prologue scan. Kept for reference; not on the refresh path (it relied on system libharfbuzz 14.2.0 as a byte-template, which doesn't match chromium-vendored 13.1.0). The MCP-driven xref-chain in FINDING_OFFSETS.md replaced it.
 
-## Layout note for the `hb_buffer_t` chase
+## Buffer layout `capture.js` depends on (HarfBuzz 13.1.0, x86-64)
 
-In chromium's vendored HarfBuzz 13.1.0:
+These are the only `hb_buffer_t` field offsets the agent reads at runtime:
 
-```
-offset  field
-0x00    hb_object_header_t (16 B: ref_count + writable + user_data)
-0x10    hb_unicode_funcs_t *unicode
-0x18    hb_buffer_flags_t flags
-0x1c    hb_buffer_cluster_level_t cluster_level
-0x20    hb_codepoint_t replacement
-0x24    hb_codepoint_t invisible
-0x28    hb_codepoint_t not_found
-0x2c    hb_codepoint_t not_found_variation_selector
-0x30    hb_buffer_content_type_t content_type
-0x34    hb_segment_properties_t props
-...
-+??     bool successful, bool have_output, bool have_positions
-+??     unsigned idx, unsigned len, unsigned out_len, unsigned allocated
-+??     hb_glyph_info_t *info, *out_info, hb_glyph_position_t *pos
-```
+| field | offset | size | used for |
+| --- | --- | --- | --- |
+| `header.writable` | `0x04` | 1 B | what `hb_buffer_add_utf16`'s prologue tests (`hb_object_is_immutable` check), used as a recognition heuristic in FINDING_OFFSETS.md |
+| `len` (unsigned int) | `0x60` | 4 B | `BUF_LEN_OFF` in `capture.js`; iteration count for codepoint extraction |
+| `info` (`hb_glyph_info_t *`) | `0x70` | 8 B | `BUF_INFO_OFF` in `capture.js`; base pointer to codepoint array |
 
-The system-14.2.0 disassembly we used to derive the prologue scan read at offsets `0x4` and `0x20` — but in 13.1.0 those are `header.writable` (1 B) and `replacement` (4 B), not `successful` and `len`. So the scan was checking the wrong field accesses. Future attempts should:
+`hb_glyph_info_t` is **20 bytes** (compile-time-guaranteed by
+`static_assert (sizeof (hb_glyph_info_t) == 20)` in `hb-buffer.h`), with
+`.codepoint` (uint32) at offset 0 — the input Unicode codepoint until
+shaping replaces it with a glyph ID.
 
-1. Compile the chromium-vendored HarfBuzz standalone with the same chromium toolchain (clang from `chromium/src/third_party/llvm-build/`) to get a byte-accurate reference, OR
-2. Read the C source for `hb_buffer_add_utf<utf16_t>` (in `hb-buffer.cc`) and derive a more robust semantic pattern (calls into `hb_buffer_pre_allocate` template — that has a distinctive `hb_realloc` call sequence), OR
-3. Just wait for Binja's full analysis (`mcp__binassist__update_analysis_and_wait`), then use `mcp__binassist__xrefs` and `get_code` to find functions reliably.
+Full struct layout, alignment derivation, and the procedure for
+re-deriving these offsets if HarfBuzz's major version changes are in
+[FINDING_OFFSETS.md § Reference layout](./FINDING_OFFSETS.md#reference-layout-harfbuzz-1310-x86-64--only-fields-capturejs-touches).

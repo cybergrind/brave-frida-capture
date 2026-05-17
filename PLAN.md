@@ -1,236 +1,56 @@
-# Implementation Plan
+# PLAN — as-built design + history
 
-Companion to [CLAUDE.md](./CLAUDE.md) — read that first for the goal,
-constraints, and source-tree map. This file is the working plan: phases,
-status, what to do when something breaks.
+Companion to [CLAUDE.md](./CLAUDE.md) (which covers the project goal and
+constraints) and [FINDING_OFFSETS.md](./FINDING_OFFSETS.md) (the
+authoritative refresh workflow). This file is the design record: what we
+built, why, and the dead ends that informed the shape.
 
-## Architecture, one diagram
+## Architecture (as built)
 
 ```
    ┌──────────────────────────────────────────────────────────────┐
    │  run.py (host)                                               │
    │                                                              │
    │   1. ensure ~/.config/BraveSoftware/brave-frida/             │
-   │   2. frida.spawn("/opt/brave-bin/brave",                     │
-   │        argv=[--no-sandbox, --user-data-dir=..., ...])        │
-   │   3. session.enable_child_gating()                           │
-   │   4. on every child: inject capture.js, set offsets          │
-   │   5. on message: print captured text                         │
+   │   2. read ~/.config/brave-flags.conf for Wayland/GPU flags   │
+   │   3. subprocess.Popen brave (NOT frida.spawn — see below)    │
+   │   4. background thread polls /proc for new PIDs whose        │
+   │      cmdline has BOTH our --user-data-dir AND --type=renderer│
+   │   5. for each match: frida.attach + inject capture.js        │
+   │   6. print each {type:"text"} message to stdout              │
    └──────────────────────────────────────────────────────────────┘
-                                │  spawn + frida-server-less inject
+                                │
                                 ▼
    ┌──────────────────────────────────────────────────────────────┐
-   │  brave (browser process)  ─── child gating ───►  renderer #N │
+   │  brave renderer process                                      │
    │                                                              │
-   │   capture.js loaded into each process. Early-exit if         │
-   │   /proc/self/cmdline does NOT contain "--type=renderer".     │
+   │   capture.js gates on /proc/self/cmdline (--type=renderer).  │
    │                                                              │
-   │   In renderers:                                              │
-   │     base = Module.findBaseAddress("brave")                   │
-   │     Interceptor.attach(base + sig.hb_buffer_add_utf16, {     │
-   │       onEnter(args) {                                        │
-   │         const text  = args[1];   // uint16_t*                │
-   │         const len16 = args[2].toInt32();                     │
-   │         const s     = text.readUtf16String(len16);           │
-   │         dedupe.add(s) && send({type:"text", pid, text:s});   │
-   │       }                                                      │
-   │     });                                                      │
+   │   base = Module.findBaseAddress("brave")  // path-filtered   │
+   │   Interceptor.attach(base + sig.hb_shape_full, {             │
+   │     onEnter(args) {                                          │
+   │       const buf  = args[1];                                  │
+   │       const len  = buf.add(0x60).readU32();                  │
+   │       const info = buf.add(0x70).readPointer();              │
+   │       // each hb_glyph_info_t is 20 B; .codepoint at +0      │
+   │       const s = readCodepoints(info, len);                   │
+   │       if (dedupe.add(s)) send({type:"text", pid, text:s});   │
+   │     }                                                        │
+   │   });                                                        │
    └──────────────────────────────────────────────────────────────┘
 ```
 
-## Phases
+## Why these specific choices
 
-### Phase 1 — Find offsets in `/opt/brave-bin/brave` (Binja MCP)
+### Hook target: `hb_shape_full`, not `hb_buffer_add_utf16`
 
-Status: **partially blocked.** Got one HarfBuzz anchor confirmed; pattern-based hunt for the actual hook targets failed and needs a different approach. See "Confirmed anchors" in [CLAUDE.md](./CLAUDE.md) for what's solid.
+The obvious target is `hb_buffer_add_utf16` — Blink passes the source text
+straight into it. We tried that first and **only captured Chromium font-probe
+text** (`Cwm fjordbank gly[phs] 😃`). Diagnosing:
 
-Findings to date:
-
-- `HB_SHAPER_LIST` string at VA `0x1f22292`, exactly one xref from VA `0x69df2ae`.
-- That xref is inside the function at VA `0x69df290` — **confirmed to be `hb_options_init`** by reading the disassembly (`getenv("HB_SHAPER_LIST")` followed by a `strchr(',')` / `strlen` token-parsing loop).
-- **Binja MCP address skew:** Binja reports addresses with a +0x400000 analysis base. Subtract 0x400000 from anything `mcp__binassist__*` returns. (Recorded permanently in CLAUDE.md.)
-- **Chromium uses `-fcf-protection=none`** — no `endbr64` bytes in `.text`. Don't use endbr as an anchor.
-- **Byte-pattern scan failed.** A wildcard prologue scan against system `libharfbuzz.so` (14.2.0) returned 0 hits in brave's HarfBuzz (13.1.0). Root cause: `hb_buffer_t` field layout differs between versions, so the "read +0x20 / read +0x4" pattern from 14.2.0 doesn't apply to 13.1.0. Tooling lives under `tools/`.
-
-Open paths to find `hb_buffer_add_utf16` / `hb_shape_full`:
-
-- **A. Wait for Binja's full analysis**, then call `mcp__binassist__update_analysis_and_wait` to confirm, and use `xrefs` from `hb_options_init` and nearby HarfBuzz functions to walk the static-link cluster. Once any other named-by-source HB function (e.g. `hb_blob_create`) is identified, its neighbors are findable. Slow but reliable.
-- **B. Source-build the chromium-vendored HarfBuzz with chromium's clang.** Use `chromium/src/third_party/llvm-build/Release+Asserts/bin/clang++` against `chromium/src/third_party/harfbuzz-ng/src/src/`. Get a byte-accurate reference for `hb_buffer_add_utf16` and `hb_shape_full`, then run the wildcard scan with versions that actually match.
-- **C. Dynamic discovery via Frida.** Hook `getenv` in `libc.so.6` (dynamically linked, easy). When called with arg `"HB_SHAPER_LIST"`, capture `this.returnAddress` — that's an address inside `hb_options_init`. From that runtime anchor, walk to nearby module memory and look for hb_buffer_add_utf16 candidates by structural disassembly via Frida's Capstone wrapper. This doesn't directly identify the function but provides a runtime sanity check on offsets from path A/B.
-- **D. Use Binja interactively in the UI** (no MCP) to navigate from `0x69df290` (real VA) → adjacent functions in the HarfBuzz cluster. The user can rename functions in the UI and the renames become visible to MCP. This is the fastest path if the user is willing to drive Binja manually for a few minutes.
-
-Recommended next step: **try (A) — let Binja finish analysis, then re-query MCP.** Falls back to (B) if Binja can't resolve functions cleanly.
-
-Anchor-driven walk:
-
-1. Search `.rodata` for HarfBuzz-distinctive strings:
-   - `HB_SHAPER_LIST` (env var read by `hb_shape_list_shapers`) — **found at
-     `0x2322292`**.
-   - `RenderTextHarfBuzz::*` trace event names — abundant; these are Chromium's
-     `ui/gfx/render_text_harfbuzz.cc`, not HarfBuzz itself. Useful for finding
-     Chromium-side text shaping callers but not the HB API targets.
-   - Backup anchors if needed: `"%c%c%c%c"`, `"ot"`/`"fallback"` shaper names
-     in the shapers table, the version string `"13.1.0"`.
-2. `xrefs` on each anchor to find the function reading the string.
-3. `get_code` (pseudo_c) on candidates to verify against the upstream C source
-   from `chromium/src/third_party/harfbuzz-ng/src/src/hb-buffer.cc` and
-   `hb-shape.cc`.
-4. For each confirmed function, record the virtual address. Convert to file
-   offset by subtracting the load base of the segment it lives in. (Brave is
-   PIE — Frida loads it at a random base; we only need the offset relative to
-   `Module.findBaseAddress("brave")`, which is the same as the file offset for
-   the `.text` mapping.)
-5. Save to `signatures.json`:
-   ```json
-   {
-     "brave_build_id": "d6091daa9f05eabe47eb1dcbe13ba40babb32521",
-     "offsets": {
-       "hb_buffer_add_utf16": "0x...",
-       "hb_shape": "0x..."
-     }
-   }
-   ```
-
-**Caveat from analysis state.** Binja reported `analysis_complete: false` for a
-283 MB binary. `update_analysis_and_wait` could take hours. Strategy: skip the
-wait — `search_strings` and `xrefs` work on partial analysis; if `get_code`
-returns a stub, force-analyze only the candidate functions individually.
-
-**Why two targets, not just `hb_buffer_add_utf16`.**
-- `hb_buffer_add_utf16` gives us the raw input text — primary signal.
-- `hb_shape` is the actual shaping call; useful as a secondary trigger and for
-  filtering (if `hb_shape` was never called, the text wasn't actually rendered).
-  Hooking both also lets us correlate by buffer pointer.
-
-### Phase 2 — Scaffold `run.py` + `signatures.json`
-
-Status: pending.
-
-Responsibilities of `run.py`:
-
-- Resolve Brave binary path (default `/opt/brave-bin/brave`, overridable via
-  `--brave`).
-- Ensure `~/.config/BraveSoftware/brave-frida/` exists; pass as
-  `--user-data-dir`. **Do not delete it between runs** — persistence is a
-  user requirement.
-- Build the spawn argv:
-  ```
-  --no-sandbox
-  --user-data-dir=<profile>
-  --no-first-run
-  --disable-features=RendererCodeIntegrity
-  ```
-- Use `frida.get_local_device().spawn(...)` then `attach()`, then
-  `session.enable_child_gating()` so renderer children get the agent injected
-  too.
-- Load `capture.js`, send `{type:"signatures", offsets:{...}}` via
-  `script.post(...)`, then `resume()` the spawned process.
-- Pump messages: print `{type:"text"}` payloads as `[pid N] <text>`.
-- Now that `pyproject.toml` declares `frida-tools` as a dependency, invoke
-  via `uv run python run.py` (uses the synced `.venv`, no ephemeral resolve
-  per invocation).
-
-### Phase 3 — `capture.js` Frida agent
-
-Status: pending.
-
-Skeleton (this is design, not final code):
-
-```js
-let OFFSETS = null;
-
-recv("signatures", msg => {
-  OFFSETS = msg.payload.offsets;
-  install();
-});
-
-function install() {
-  const argv0 = readCmdline();
-  if (!argv0.includes("--type=renderer")) return;
-
-  const base = Module.findBaseAddress("brave");
-  if (!base) { send({type:"error", msg:"no brave module"}); return; }
-
-  const addr = base.add(parseInt(OFFSETS.hb_buffer_add_utf16, 16));
-  const seen = new Map();   // small LRU keyed by string
-
-  Interceptor.attach(addr, {
-    onEnter(args) {
-      const textPtr = args[1];
-      const len16   = args[2].toInt32();
-      if (len16 <= 0 || len16 > 1 << 20) return;
-      const s = textPtr.readUtf16String(len16);
-      if (!s || seen.has(s)) return;
-      if (seen.size > 4096) seen.delete(seen.keys().next().value);
-      seen.set(s, 1);
-      send({type:"text", text: s});
-    }
-  });
-}
-```
-
-Edge cases:
-
-- `Module.findBaseAddress("brave")` may need the basename actually used by the
-  loader — could be `"brave"` or full path. Try both.
-- Some renderer processes are utility processes that also have `--type=...`;
-  filter for `--type=renderer` specifically.
-- High-volume dedupe: per-process LRU is fine; cross-process dedupe is the
-  Python side's job if we want it.
-
-### Phase 4 — README and refresh workflow
-
-Status: pending.
-
-Must document:
-
-- Install prereqs (`uv`, Brave, Binja with BinAssist MCP plugin if regenerating
-  offsets).
-- How to run: `./run.py` and what to expect on stdout.
-- **Signature refresh procedure** for when Brave updates: open new Brave in
-  Binja → connect MCP → re-run anchor search → update `signatures.json` +
-  `brave_build_id`. Future Claude sessions can do this end-to-end.
-- Known limits:
-  - No canvas/WebGL rendered text (no shaping path).
-  - Text in hidden/off-screen DOM still gets shaped → captured.
-  - `--no-sandbox` is required; treat the PoC profile as untrusted.
-  - One Brave version at a time; signatures don't carry across builds.
-
-### Phase 5 — Test
-
-Status: **done.** PoC captures real page text end-to-end.
-
-Two adjustments forced by reality:
-
-1. **Don't `frida.spawn()` Brave.** Holding Brave under Frida child-gating
-   stalled Brave's startup — gpu / utility / broker / renderer processes
-   never came up, only zygote + crashpad-handler. Switched to launching
-   Brave with `subprocess.Popen` and using Frida solely to *attach* to
-   renderers as they appear in `/proc` (matched by `--user-data-dir=` to
-   our profile so we don't attach to the user's other Brave instance).
-2. **Read `~/.config/brave-flags.conf`.** The user's Wayland desktop needs
-   `--ozone-platform=wayland` for Brave to create a window at all. The
-   system `/usr/bin/brave` wrapper applies that conf; our launcher
-   bypasses the wrapper, so it now reads the same conf inline.
-
-Sample observed output for `--new-window https://en.wikipedia.org/wiki/HarfBuzz`:
-
-```
-[pid N] About Wikipedia
-[pid N] From Wikipedia, the free encyclopedia
-[pid N] Apple Advanced Typography shaping,
-[pid N] Core Text, the macOS equivalent (HarfBuzz can be used as an alternative on macOS)
-[pid N] 14.2.0
-[pid N] (20 April 2026; 23 days ago) [±]
-... 482 total
-```
-
-All match visible page content (body text, sidebar, infobox, references).
-
-### Important architecture change discovered during verification
-
-The first hook target (`hb_buffer_add_utf16`) was **insufficient.** Blink's
-`harfbuzz_shaper.cc` and `case_mapping_harfbuzz_buffer_filler.cc` both have:
+Blink's shape paths in `harfbuzz_shaper.cc` (`HarfBuzzShaper::GetGlyphData`,
+~line 1175) and `case_mapping_harfbuzz_buffer_filler.cc` (~line 31) branch
+on the string's storage width:
 
 ```cpp
 if (text.Is8Bit()) {
@@ -240,48 +60,166 @@ if (text.Is8Bit()) {
 }
 ```
 
-So ASCII text (the majority of web content) goes through `hb_buffer_add_latin1`,
-which we weren't hooking. The first test run only captured `Cwm fjordbank gly[phs] 😃`
-because that's Chromium's font-coverage probe text — full of non-Latin-1
-codepoints that hit `hb_buffer_add_utf16`. Real page ASCII text went uncaught.
+ASCII page text takes the `_latin1` path, which our hook missed. The probe
+strings showed because they contain non-Latin-1 codepoints (Welsh
+pangram + emoji) → forced into `_utf16`.
 
-**Fix:** hook `hb_shape_full` instead. It runs after the buffer is fully
-populated regardless of which `hb_buffer_add_*` filled it. Read the buffer's
-`info[]` array; each 20-byte slot starts with the input codepoint (uint32).
+**Fix:** hook `hb_shape_full` — every text run, regardless of which
+`hb_buffer_add_*` variant filled the buffer, passes through it. At entry,
+`buffer->info[i].codepoint` holds the input Unicode codepoint (replaced
+with a glyph ID later in the same call), so we read the buffer directly.
 
-Verified `hb_buffer_t` field offsets in chromium-vendored HarfBuzz 13.1.0:
-- `+0x60`: `unsigned int len` (confirmed by hb_shape_full's `mov 0x60(%rsi),%eax; test %eax,%eax; je <bail>`)
-- `+0x70`: `hb_glyph_info_t *info` (confirmed by diagnostic dump)
-- `hb_glyph_info_t` stride: 20 bytes; `.codepoint` (uint32) at offset 0
+Verified against the Wikipedia HarfBuzz article: 482 captured lines, all
+matching visible page content — infobox values (`14.2.0`), sidebar links,
+body paragraphs, citation entries.
 
-Diagnostic dump from a captured buffer:
-```
-+0x60: 3c 00 00 00 ...   ; len = 60
-+0x70: 00 95 0e 00 54 26 00 00   ; info = 0x2654000e9500
-info[0]: 50 00 00 00 ...   ; codepoint = 0x50 = 'P'
-```
-…which matches the first char of "Please confirm that you and not a robot…".
+### Launch model: subprocess, not `frida.spawn` + child gating
 
-- Launch via `run.py`.
-- Navigate to: a static text-heavy article (e.g. a Wikipedia page),
-  `about:blank` (sanity, should be silent), `chrome://version` (catches us
-  capturing chrome UI text — should NOT, because chrome:// pages render in a
-  renderer, so we WILL capture them; document this clearly).
-- Spot-check: visible page text appears in output; clear browser UI strings
-  (window title bar, menus) do not appear.
+The Frida-idiomatic approach is `frida.spawn(brave)` +
+`session.enable_child_gating()` to catch every child process Brave forks.
+We tried that. **Brave's startup stalled** — gpu / utility / broker /
+renderer processes never came up; only zygote + crashpad-handler appeared.
+Chromium's zygote uses a fork/clone variant that Frida's gating doesn't
+handle cleanly, and holding the parent under Frida's gate makes the bigger
+problem visible.
 
-## Backlog / known limits / future work
+**Fix:** launch Brave as a plain `subprocess.Popen` (no Frida hold), and
+use Frida only to *attach* to renderer PIDs as they appear in `/proc`.
+The polling thread filters on the spawned process's `--user-data-dir=` so
+we don't attach to the user's other Brave instance.
 
-- **Glyph IDs vs strings:** we hook before shaping, so we always get readable
-  text. If we wanted post-shaping (i.e. what actually rasterized), we'd hook
-  `SkCanvas::onDrawTextBlob` — and lose readability. Not worth it for this
-  PoC.
-- **Cross-process correlation:** currently each renderer dedupes
-  independently. If two tabs render the same page we'll see strings twice.
-  Fine for PoC.
-- **Output formats:** currently stdout. Trivial follow-on to JSONL/SQLite.
-- **Viewport awareness:** no signal here on whether shaped text is actually
-  in the visible viewport. Would need to also hook compositor layer commits —
-  much harder.
-- **Other browsers:** the technique transfers to Chrome, Edge, Opera —
-  same HarfBuzz, just different offsets.
+Side benefit: we can disambiguate which Brave we're driving by profile,
+not by PID tree.
+
+### Read `~/.config/brave-flags.conf`
+
+The user's Wayland desktop needs `--ozone-platform=wayland` for Brave to
+create a window at all; the system `/usr/bin/brave` shell wrapper passes
+flags from `~/.config/brave-flags.conf`. We bypass that wrapper by going
+straight to `/opt/brave-bin/brave`, so `run.py` reads the same conf inline
+(splitting on lines, skipping comments and blanks).
+
+### Persistent profile (not throwaway)
+
+`~/.config/BraveSoftware/brave-frida/` is reused across runs. Originally
+intended for cookies/logins persistence; in practice it also means Brave
+restores session tabs, which can mislead naive testing (we initially saw
+captured text from a restored Yandex captcha tab, not the URL we passed).
+Use `--new-window <url>` when verifying to force a focused window with
+fresh content.
+
+## Phases
+
+### Phase 1 — Find offsets in `/opt/brave-bin/brave` — DONE
+
+Initial pattern-scan approach (comparing system libharfbuzz 14.2.0 bytes to
+brave's vendored 13.1.0) failed: clang vs gcc prologues differ, and
+`hb_buffer_t` field offsets shifted between HarfBuzz major versions, so
+"prologue + read +0x4 + read +0x20" matched zero functions.
+
+Replaced with an **MCP-driven xref chain**, which became the workflow
+documented in [FINDING_OFFSETS.md](./FINDING_OFFSETS.md):
+
+1. `HB_SHAPER_LIST` string in `.rodata` → real VA `0x1f22292`.
+2. Only RIP-relative LEA xref → inside `hb_shapers_lazy_loader_t::create`
+   (not `hb_options_init` — that function was removed from HarfBuzz long
+   ago) at real VA `0x69df290`.
+3. `mcp__binassist__xrefs` for callers of the lazy loader → two HarfBuzz
+   internals. The one with a `mov 0x60(%rsi),%eax; test;je` early-out AND
+   subsequent `movw $0, 0xd0(%rsi)` + `movl $0, 0xd8(%rsi)` (the `enter()`
+   scratch-state zeroing) is `hb_shape_full` — real VA `0x44c9070`.
+4. Sanity-anchor `hb_buffer_add_utf16` reached by walking from a Blink
+   caller of `hb_shape_full` and matching the `+0x4` writable check + the
+   text_length/item_length sentinel comparisons → real VA `0x44bec70`.
+
+Quirks recorded along the way:
+
+- **Binja MCP returns addresses with a `+0x400000` skew** for the current
+  database (binary's preferred image base). Not universal — measure per
+  build. Documented in FINDING_OFFSETS.md.
+- **Chromium uses `-fcf-protection=none`** — no `endbr64` bytes in
+  `.text`. Don't try to use endbr as a function-start anchor.
+
+### Phase 2 — `run.py` launcher — DONE
+
+- Brave path overridable via `--brave`; default `/opt/brave-bin/brave`.
+- Profile dir `~/.config/BraveSoftware/brave-frida/`, created if missing,
+  preserved across runs.
+- Spawn argv (in order): `<brave>`, flags from `~/.config/brave-flags.conf`,
+  `--no-sandbox`, `--user-data-dir=<profile>`, `--no-first-run`,
+  `--no-default-browser-check`,
+  `--disable-features=RendererCodeIntegrity`, then any user args after `--`.
+- `subprocess.Popen` with stdout/stderr discarded.
+- Background polling thread that scans `/proc/*/cmdline` once per second,
+  attaches Frida to any new PID containing both `--user-data-dir=<profile>`
+  and `--type=renderer`.
+- Invocation: `uv run python run.py` (env declared in `pyproject.toml`).
+
+### Phase 3 — `capture.js` Frida agent — DONE
+
+- Early-exits in non-renderer processes (`/proc/self/cmdline` check for
+  `--type=renderer`).
+- Module lookup uses `BRAVE_PATH_HINT = '/brave-bin/brave'` to filter out
+  same-basename non-brave modules (e.g. crashpad_handler if it happens to
+  share a name).
+- Interceptor at `module_base + offsets.hb_shape_full`.
+- Reads `len` at `+0x60`, `info` ptr at `+0x70`, iterates 20-byte
+  `hb_glyph_info_t` records, picks codepoint at `+0` of each, validates
+  in `[0, 0x10ffff]`.
+- Per-process LRU dedupe of size 4096; whitespace-trimmed strings.
+- Sends `{type:"text", pid, text, len}` back to the host.
+
+### Phase 4 — Documentation — DONE
+
+- `README.md` — user-facing run instructions, known limits.
+- `FINDING_OFFSETS.md` — refresh workflow for new Brave builds; pressure-tested by three reviewer subagents (defects found: misnamed anchor function, non-universal Binja skew, wrong field-offset narrative, stale fallback advice — all corrected).
+- This file — design + history.
+- `CLAUDE.md` — orientation for future agents.
+
+### Phase 5 — End-to-end verification — DONE
+
+Wikipedia HarfBuzz article via `uv run python run.py -- --new-window
+https://en.wikipedia.org/wiki/HarfBuzz` produced 482 unique captured
+lines, all matching visible page content. Diagnostic buffer dump
+confirmed `len@+0x60` and `info@+0x70` offsets; `info[0].codepoint =
+0x50 = 'P'` matched the first char of "Please confirm that you and not a
+robot…" from an earlier capture.
+
+## Backlog / known limits
+
+- **Text fragmented at shape-run boundaries.** HarfBuzz shapes one
+  script-run / font-fallback region at a time, so "Cwm fjordbank, vext
+  quiz, 😃 glyphs" can land as separate captures for `Cwm`, `fjordbank`,
+  `vext quiz`, `😃`, `glyphs`. Reconstruction would need correlating runs
+  by buffer pointer and cluster index — out of PoC scope.
+- **Glyph IDs vs Unicode.** We hook before shaping, so we always get
+  readable codepoints. Post-shaping (what actually rasterized to pixels)
+  would mean hooking `SkCanvas::onDrawTextBlob` — and losing readability.
+- **No viewport awareness.** Off-screen and hidden DOM text still gets
+  shaped, so will be captured. Adding a viewport filter would require
+  also hooking compositor layer commits.
+- **Cross-process dedupe.** Per-renderer LRU only. Two tabs rendering the
+  same content yield duplicates on stdout.
+- **No canvas / WebGL.** `<canvas>` `fillText` may bypass HarfBuzz
+  entirely depending on the Skia path; WebGL text is invisible.
+- **Single Brave build at a time.** Offsets pin to the build-id in
+  `signatures.json`. Brave upgrade silently breaks the hook — agent
+  attaches but at the wrong address. Refresh via
+  [FINDING_OFFSETS.md](./FINDING_OFFSETS.md).
+- **No chrome:// filter.** `chrome://settings`, `chrome://version`, etc.
+  render in regular renderer processes; their text is captured too.
+  Filter on the consumer side if you want web-only output.
+
+## Portability sketch
+
+Same technique should transfer to Chrome, Edge, Opera, and other
+Chromium-based browsers with statically-linked HarfBuzz:
+
+- Anchors are HarfBuzz's, not Brave's — `HB_SHAPER_LIST` works anywhere
+  HarfBuzz is statically linked.
+- Buffer offsets are HarfBuzz-version-tied (not browser-tied).
+- `run.py` would need profile dir, ozone flag, and Brave-specific arg
+  changes.
+- `capture.js`'s `BRAVE_PATH_HINT` becomes browser-specific.
+
+Untried but believed straightforward.

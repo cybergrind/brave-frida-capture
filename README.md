@@ -32,7 +32,7 @@ codepoints. Hooking `hb_shape_full` catches both paths from a single point.
   frida-tools environment declared in `pyproject.toml`.
 - `~/.config/BraveSoftware/brave-frida/` will be created on first run. The
   profile **persists across runs**.
-- A `signatures.json` with non-null offsets for `hb_buffer_add_utf16` (see
+- A `signatures.json` with a non-null offset for `hb_shape_full` (see
   "Finding offsets" below). Without offsets the agent loads but skips hooking.
 
 ## Run
@@ -88,38 +88,19 @@ PT_LOAD). At runtime the agent uses
 
 ### Finding offsets, the workflow
 
-Two viable approaches; pick by what's installed locally.
+See **[FINDING_OFFSETS.md](./FINDING_OFFSETS.md)** for the full step-by-step
+procedure — that's the authoritative source, kept in sync with the actual
+hook code. Short version: anchor on the `HB_SHAPER_LIST` string in
+`.rodata`, walk one xref to its enclosing function
+(`hb_shapers_lazy_loader_create` — not `hb_options_init`, which doesn't
+exist in vendored HarfBuzz 13.x), use that function's callers to find
+`hb_shape_full`, verify by disassembly heuristics, drop the offset into
+`signatures.json`, run the Wikipedia verification.
 
-#### A. Binary Ninja + BinAssist MCP (what we did)
-
-1. Open `/opt/brave-bin/brave` in Binja and let analysis run. **Heads up: the
-   binary is ~283 MB; full analysis can take a long time and will lock the MCP
-   server while running.** You can use partial analysis — just be ready to
-   re-trigger function analysis on specific addresses.
-2. Connect Binja MCP (BinAssist) so a Claude session can drive it.
-3. Find `HB_SHAPER_LIST` in Strings; the only xref is inside
-   `hb_options_init`. Rename it.
-4. From `hb_options_init`, browse neighboring functions — HarfBuzz code is one
-   contiguous static-link cluster. Identify `hb_buffer_add_utf16` and
-   `hb_shape_full` by argument count (5) and structural traits described in
-   [PLAN.md](./PLAN.md).
-5. **Subtract `0x400000`** from every address Binja returns — Binja MCP
-   reports addresses with a +0x400000 analysis base offset. The actual VA
-   matches the file offset for this binary.
-6. Edit `signatures.json` with the corrected offsets.
-
-#### B. Standalone scanner against a chromium-built reference
-
-1. Build chromium-vendored HarfBuzz with chromium's toolchain:
-   ```
-   third_party/llvm-build/Release+Asserts/bin/clang++ -O2 ... \
-       third_party/harfbuzz-ng/src/src/*.cc
-   ```
-2. Dump bytes of `hb_buffer_add_utf16` and `hb_shape_full` from the resulting
-   object file (`objdump -d --disassemble=hb_buffer_add_utf16`).
-3. Run `tools/find_xref.py` (for string xrefs) and a wildcard-byte scanner
-   against `/opt/brave-bin/brave`. The patterns now match because the compiler
-   *and* HarfBuzz version are identical.
+`tools/find_xref.py` is a self-configuring fallback when Binja MCP is
+unresponsive — reads ELF program headers to locate `.text`, no per-build
+constants. Invoke as `python3 tools/find_xref.py <hex_target_va>
+[path/to/binary]`.
 
 ## Known limits
 
@@ -150,13 +131,15 @@ Two viable approaches; pick by what's installed locally.
 
 | File | Purpose |
 | --- | --- |
-| [`CLAUDE.md`](./CLAUDE.md) | Project orientation for Claude (or any reader picking this up cold) — goal, constraints, source-tree map |
-| [`PLAN.md`](./PLAN.md) | Implementation plan, current status, signature-refresh workflow |
-| `run.py` | Launcher: profile setup, Frida spawn + child gating, message handler |
-| `capture.js` | Frida agent: renderer-gated, hooks the configured offset, dedupes, sends back |
-| `signatures.json` | Per-build offsets and metadata |
-| `tools/find_xref.py` | `.text` scanner for RIP-relative LEA references to a target VA |
-| `tools/find_hb_buffer_add.py` | Wildcard prologue scanner (work in progress) |
+| [`CLAUDE.md`](./CLAUDE.md) | Project orientation for any cold-reading agent — goal, constraints, source-tree map, current anchors |
+| [`PLAN.md`](./PLAN.md) | As-built design + history of dead ends |
+| [`FINDING_OFFSETS.md`](./FINDING_OFFSETS.md) | Authoritative refresh workflow for new Brave builds |
+| `run.py` | Launcher: subprocess Brave, polls /proc for renderers, Frida-attach each |
+| `capture.js` | Frida agent: renderer-gated, hooks `hb_shape_full`, reads `buffer->info[].codepoint`, dedupes, sends back |
+| `signatures.json` | Per-build offsets, build-id, known anchors |
+| `pyproject.toml` | `uv sync` then `uv run python run.py` |
+| `tools/find_xref.py` | Self-configuring `.text` scanner for RIP-relative LEA refs to a target VA |
+| `tools/find_hb_buffer_add.py` | Abandoned wildcard-prologue scan, kept for reference |
 
 ## Troubleshooting
 
@@ -174,8 +157,12 @@ to `MODULE_NAMES` in `capture.js`. Use Frida's REPL on the running renderer
 to introspect: `frida -p <renderer_pid>` then `Process.enumerateModules()[0]`.
 
 **Frida fails to attach to renderers.** Confirm `--no-sandbox` is in the
-spawn argv — `run.py` adds it by default. Confirm child gating is enabled
-(stderr should show `[child <pid>] spawned`).
+spawn argv — `run.py` adds it by default. Stderr should show
+`[poll-attach <pid>] renderer detected` for each renderer; if not, the
+polling loop didn't see a matching cmdline (`--user-data-dir=<profile>`
+AND `--type=renderer`). On hardened kernels, also check
+`cat /proc/sys/kernel/yama/ptrace_scope` — default `1` is fine
+(self-spawned children) but `2` / `3` will block ptrace.
 
 **Massive output volume.** Reduce noise by tightening the dedupe window or
 adding a length filter in `capture.js`. The LRU is currently size 4096 per
