@@ -165,6 +165,19 @@ SystemV AMD64 calling convention puts `buffer` in `rdi`, `text` in `rsi`,
 | `hb_shape_full` | `0x46876c0` | reached via `find_callers.py 0x69c6000` (one of two callers). The function `capture.js` actually hooks. |
 | `hb_buffer_add_utf16` | `0x4682850` | secondary anchor / sanity check. Found by walking from a Blink caller of `hb_shape_full` (at `0xe0f04e2`). |
 | `getenv@plt` | `0x11120920` | PLT trampoline reachable from `hb_shapers_lazy_loader_create + 0x25`. |
+| `DisplayItemList::Raster` (string) | `0x1bad17c` | seed for the Phase 6 dispatcher hunt; only one xref. |
+| `PaintOpWithFlags::RasterWithFlags` | `0x3f59ad0` | the cc::PaintOp rasterizer dispatcher. Reads `op->type` byte at `+0`, bounds-checks against `kNumOpTypes` (36), loads `g_raster_with_flags_functions[type]`. clang LTO inlined the kDrawRect (18), kDrawPath (16), kDrawTextBlob (23) cases. Invoked only by the **gpu-process** during raster; renderer never reaches it. Phase 6's hook target; JS filters by `op->type == 23` and reads `op->x`/`op->y`. |
+| `DrawTextBlobOp` field offsets | `x=+0x78`, `y=+0x7c`, `blob=+0x50` | verified by disassembling the kDrawTextBlob inlined case (`movss 0x78(%r14),%xmm0; movss 0x7c(%r14),%xmm1; call <SkCanvas::drawTextBlob>`). |
+| `g_raster_with_flags_functions` table | `0x11a5ed20` | in `.data.rel.ro`. 36 entries, each filled at relocation time with `0x6fe9650 + 8*i` (an 8-byte `jmp rel32` trampoline). Out-of-line copies of the rasterizer bodies exist (e.g. `0x6174c60` for kDrawTextBlob) but are unreachable on the hot path because the cases were inlined into the dispatcher — see PLAN.md Phase 6. |
+| `SkCanvas::drawTextBlob` | `0x3f61330` | called from the kDrawTextBlob inlined case with `(canvas, blob, x, y, paint)`. Fallback Phase 6 hook target — if `op->x`/`op->y` reads ever drift, hooking here and reading x/y from `xmm0`/`xmm1` is the cross-check. |
+| `DrawRectOp::RasterWithFlags` | `0x595a250` | Phase 7. `g_raster_with_flags_functions[18]` via the jmp-stub at `0x6fe96e0`. 4-arg `(op, flags, canvas, params)`; `op->rect` at `op+0x50`. |
+| `DrawRRectOp::RasterWithFlags` | `0x3deabc0` | Phase 7. Slot 19 via stub `0x6fe96e8`. `op->rrect.fRect` at `op+0x50` (SkRRect's bounding rect is its first 16 B). |
+| `DrawIRectOp::RasterWithFlags` | `0x3df0d20` | Phase 7. Slot 12 via stub `0x6fe96b0`. `op->rect` = 4 int32 at `op+0x50` (note: read with `readS32`, not `readFloat`). |
+| `DrawOvalOp::RasterWithFlags` | `0x3de6020` | Phase 7. Slot 15 via stub `0x6fe96c8`. `op->oval` (bounding `SkRect`) at `op+0x50`. |
+| `SkCanvas::drawRect` | `0x3f71470` | Phase 7 primary hook. SkCanvas member: `rdi=this, rsi=&SkRect, rdx=&SkPaint`. Catches every filled rect, including those whose cc::PaintOp got LTO-inlined past the per-op `RasterWithFlags` entries. |
+| `PaintFlags::color_` | `+0x00` from flags arg | SkColor4f (4 f32 RGBA) — first field of `CorePaintFlags`. Confirmed by `movups (%r15),%xmm0` in the dispatcher's kDrawRect inlined case (`r15` = flags). |
+| `SkCanvas::fMCRec` | `+0x640` from `SkCanvas*` | Pointer to top of the matrix-clip-record stack. Phase 8 CTM read. Confirmed by `mov 0x640(%rbx),%rdi; add $0x18,%rdi; call SkM44::mapRect` in both `SkCanvas::drawRect` and `SkCanvas::drawTextBlob`. |
+| `MCRec::fMatrix` | `+0x18` from `MCRec*` | `SkM44` (16 column-major f32, `(r,c)=fMat[c*4+r]`). The current transform. Phase 8 reads all 16 floats; for 2D the agent emits `[m00,m01,m03,m10,m11,m13]` as the `ctm` record field. |
 
 The full step-by-step methodology — including how to identify these
 functions in a fresh Brave build — lives in

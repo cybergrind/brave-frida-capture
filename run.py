@@ -77,16 +77,63 @@ def load_signatures(path: Path) -> dict:
     return data
 
 
-def make_message_handler(pid: int):
+def make_message_handler(pid: int, jsonl_sink=None, jsonl_lock: threading.Lock | None = None):
     def handler(message, data):
         if message.get('type') == 'error':
             sys.stderr.write(f'[pid {pid}] frida error: {message.get("stack") or message.get("description")}\n')
             return
         payload = message.get('payload') or {}
         kind = payload.get('type')
+        # Tee the raw record to the JSONL sink (if any) before we humanise it.
+        # Skip the chatty meta records so the JSONL file stays a pure stream
+        # of capture events for the renderer.
+        if jsonl_sink is not None and kind in ('text', 'draw_text', 'draw_rect'):
+            line = json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n'
+            with jsonl_lock:
+                jsonl_sink.write(line)
+                jsonl_sink.flush()
         if kind == 'text':
             text = payload['text']
             sys.stdout.write(f'[pid {payload.get("pid", pid)}] {text}\n')
+            sys.stdout.flush()
+        elif kind == 'draw_text':
+            who = payload.get('kind', '?')
+            op = payload.get('op', '')
+            has_xy = 'x' in payload and 'y' in payload
+            has_sxy = 'sx' in payload and 'sy' in payload
+            if has_xy and has_sxy:
+                sys.stdout.write(
+                    f'[pid {payload.get("pid", pid)}] draw_text {who} '
+                    f'sx={payload["sx"]:.2f} sy={payload["sy"]:.2f} '
+                    f'(x={payload["x"]:.2f} y={payload["y"]:.2f}) op={op}\n'
+                )
+            elif has_xy:
+                sys.stdout.write(f'[pid {payload.get("pid", pid)}] draw_text {who} x={payload["x"]:.2f} y={payload["y"]:.2f} op={op}\n')
+            else:
+                sys.stdout.write(f'[pid {payload.get("pid", pid)}] draw_text {who} op={op}\n')
+            sys.stdout.flush()
+        elif kind == 'draw_rect':
+            who = payload.get('kind', '?')
+            op = payload.get('op', '')
+            color = payload.get('color', '')
+            color_tag = f' color={color}' if color else ''
+            has_abs = all(k in payload for k in ('sleft', 'stop', 'sright', 'sbottom'))
+            if has_abs:
+                sys.stdout.write(
+                    f'[pid {payload.get("pid", pid)}] draw_rect {who} '
+                    f'sl={payload["sleft"]:.2f} st={payload["stop"]:.2f} '
+                    f'sr={payload["sright"]:.2f} sb={payload["sbottom"]:.2f} '
+                    f'(l={payload["left"]:.2f} t={payload["top"]:.2f} '
+                    f'r={payload["right"]:.2f} b={payload["bottom"]:.2f})'
+                    f'{color_tag} op={op}\n'
+                )
+            else:
+                sys.stdout.write(
+                    f'[pid {payload.get("pid", pid)}] draw_rect {who} '
+                    f'l={payload["left"]:.2f} t={payload["top"]:.2f} '
+                    f'r={payload["right"]:.2f} b={payload["bottom"]:.2f}'
+                    f'{color_tag} op={op}\n'
+                )
             sys.stdout.flush()
         elif kind in ('ready', 'skip', 'hooked', 'warn', 'error'):
             sys.stderr.write(f'[pid {pid}] {kind}: {json.dumps({k: v for k, v in payload.items() if k != "type"})}\n')
@@ -96,14 +143,21 @@ def make_message_handler(pid: int):
     return handler
 
 
-def inject(device: frida.core.Device, pid: int, agent_src: str, sig_payload: dict) -> frida.core.Session | None:
+def inject(
+    device: frida.core.Device,
+    pid: int,
+    agent_src: str,
+    sig_payload: dict,
+    jsonl_sink=None,
+    jsonl_lock: threading.Lock | None = None,
+) -> frida.core.Session | None:
     try:
         session = device.attach(pid)
     except frida.ProcessNotFoundError:
         return None
     session.enable_child_gating()
     script = session.create_script(agent_src)
-    script.on('message', make_message_handler(pid))
+    script.on('message', make_message_handler(pid, jsonl_sink, jsonl_lock))
     script.load()
     script.post({'type': 'signatures', 'payload': sig_payload})
     return session
@@ -120,6 +174,13 @@ def main() -> int:
     )
     p.add_argument('--signatures', type=Path, default=DEFAULT_SIGNATURES)
     p.add_argument('--agent', type=Path, default=DEFAULT_AGENT)
+    p.add_argument(
+        '--jsonl',
+        type=Path,
+        default=None,
+        help='if set, tee raw text/draw_text/draw_rect records to this JSONL file '
+        '(for downstream render_ascii.py). Truncates on open.',
+    )
     p.add_argument('brave_args', nargs='*', help='extra args forwarded to brave (after `--`)')
     args = p.parse_args()
 
@@ -130,6 +191,14 @@ def main() -> int:
     sig_data = load_signatures(args.signatures)
     sig_payload = {'offsets': sig_data.get('offsets') or {}}
     agent_src = args.agent.read_text()
+
+    jsonl_sink = None
+    jsonl_lock: threading.Lock | None = None
+    if args.jsonl is not None:
+        # Truncate on open — a single run = a single capture session.
+        jsonl_sink = args.jsonl.open('w', encoding='utf-8')
+        jsonl_lock = threading.Lock()
+        sys.stderr.write(f'tee jsonl: {args.jsonl}\n')
 
     argv = build_argv(args.brave, args.profile, args.brave_args)
     sys.stderr.write(f'spawn: {" ".join(argv)}\n')
@@ -174,12 +243,13 @@ def main() -> int:
                         continue
                     if profile_marker not in cmdline:
                         continue
-                    if '--type=renderer' not in cmdline:
+                    # Attach to renderer (hb_shape_full) AND gpu-process (PaintOp raster dispatch).
+                    if '--type=renderer' not in cmdline and '--type=gpu-process' not in cmdline:
                         continue
                     # log a short cmdline tail so we can identify which tab this renderer is for
                     tail = cmdline.split('--')[-1][-160:]
                     sys.stderr.write(f'[poll-attach {pid_n}] renderer detected (...{tail})\n')
-                    sess = inject(device, pid_n, agent_src, sig_payload)
+                    sess = inject(device, pid_n, agent_src, sig_payload, jsonl_sink, jsonl_lock)
                     if sess is not None:
                         sessions[pid_n] = sess
             except Exception as e:
@@ -203,6 +273,9 @@ def main() -> int:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if jsonl_sink is not None:
+            with contextlib.suppress(Exception):
+                jsonl_sink.close()
 
     return 0
 

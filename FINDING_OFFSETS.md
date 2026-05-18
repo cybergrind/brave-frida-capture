@@ -431,6 +431,348 @@ git add signatures.json
 git commit -m "Refresh offsets for Brave <version> (build <short-id>)"
 ```
 
+## Phase 6 anchors: `paint_op_with_flags_RasterWithFlags` + DrawTextBlobOp x/y
+
+The Phase 6 hook needs ONE address in `/opt/brave-bin/brave` (the
+dispatcher) and TWO struct offsets (`op->x`, `op->y`) inside
+DrawTextBlobOp. They're recorded under `offsets:` in `signatures.json` as
+`paint_op_with_flags_RasterWithFlags`, `draw_text_blob_op_x_offset`, and
+`draw_text_blob_op_y_offset` (defaults `0x78` / `0x7c`).
+
+The dispatcher fires only in the **gpu-process** (`--type=gpu-process`),
+not in renderers. `run.py` and `capture.js` already filter on both
+process types.
+
+### Refresh workflow
+
+#### Step P1 — find the dispatcher
+
+Seed anchor: the literal string `"DisplayItemList::Raster"` (ASCII, in
+`.rodata`).
+
+```bash
+strings -t x /opt/brave-bin/brave | grep -F 'DisplayItemList::Raster'
+# → e.g. "1bad17c DisplayItemList::Raster" — real VA
+```
+
+There's exactly one xref to that string inside
+`cc::DisplayItemList::Raster`. That function calls
+`cc::PaintOpBuffer::Playback`, which calls
+`cc::PaintOpWithFlags::RasterWithFlags` (the dispatcher we want). With
+Binja:
+
+```text
+mcp__binassist__xrefs(filename="brave.bndb",
+                       address_or_name="0x<DisplayItemList_Raster_string_binja_addr>",
+                       direction="to")
+mcp__binassist__get_parent_function(filename="brave.bndb",
+                                     address="<one xref>")
+# → cc::DisplayItemList::Raster
+mcp__binassist__get_code(filename="brave.bndb",
+                          function_name_or_address="<that addr>",
+                          format="decompile")
+# → look for a `sub_XXXXXX(rdi, &flags, &canvas)` near a `cmp 0x60 / + 0x68` check;
+# that callee is PaintOpBuffer::Playback (similar internal structure).
+```
+
+`PaintOpBuffer::Playback` in turn dispatches to the dispatcher via the
+`flags_op.RasterWithFlags` call. The dispatcher's fingerprint is:
+
+- 4 args (`%rdi=op`, `%rsi=flags`, `%rdx=canvas`, `%rcx=params`).
+- Reads `op->type` as `movzx ecx, byte [rdi]` near the prologue.
+- Compares against `kNumOpTypes` (`cmp $0x24,%rcx; jae <trap>`).
+- Loads a function-pointer table with `lea rax, [rel <data.rel.ro addr>]; mov rax, [rax+rcx*8]`.
+- Has explicit inlined cases for hot types — at minimum `cmp $0x12, %rcx; je <kDrawRect>` and `cmp $0x17, %ecx; je <kDrawTextBlob>` (0x12=18, 0x17=23).
+
+**No-Binja path:** scan `.text` for the prologue pattern + jump-table
+indirection. Easiest: grep objdump for `cmp $0x24,%rcx` and pick the hit
+where the next dozen instructions match the fingerprint above.
+
+```bash
+objdump -d /opt/brave-bin/brave 2>/dev/null \
+  | awk '/cmp\s+\$0x24,%rcx/{p=NR; print}' \
+  | head -5
+```
+
+Take any hit, then `objdump -d --start-address=<HIT - 0x40> --stop-address=<HIT + 0x80>` and walk backward over `cc` padding to the function prologue (`push %rbp; mov %rsp,%rbp; push %r15; ...`). Verify the inlined case structure (`movss 0x78(%r14), %xmm0` somewhere in the kDrawTextBlob branch — see step P2).
+
+Record the dispatcher's real VA as
+`offsets.paint_op_with_flags_RasterWithFlags`.
+
+#### Step P2 — verify DrawTextBlobOp x/y offsets
+
+Inside the dispatcher, find the kDrawTextBlob inlined case (reached
+from the `cmp $0x17, %ecx; je <case>` at a few-byte offset from the
+function start). Disassemble there; the case body must contain, in
+order:
+
+```
+mov  0x80(%rNN),%esi             ; op->node_id check
+cmp  0x70(%rNN),... or similar   ; params.is_analyzing check (offset 0x70 into params)
+mov  0x50(%rNN),%rsi             ; op->blob.get()
+movss 0x78(%rNN),%xmm0           ; op->x  ← record this offset
+movss 0x7c(%rNN),%xmm1           ; op->y  ← record this offset
+call <SkCanvas::drawTextBlob>
+```
+
+If `op->x` / `op->y` land at offsets other than `0x78` / `0x7c`, update
+`draw_text_blob_op_{x,y}_offset` accordingly. They've been stable since
+the field layout `blob; slug; extra_slugs; x; y; node_id` got
+established in cc/paint/paint_op.h.
+
+The kNumOpTypes value (currently 36) and the kDrawSlug / kDrawTextBlob
+enum indices (22 / 23) come from `cc/paint/paint_op.h:85` — bump
+them if Chromium adds new enum variants.
+
+#### Step P3 — verify in a live gpu-process
+
+Either re-run end-to-end (`uv run python run.py -- --new-window
+https://en.wikipedia.org/wiki/HarfBuzz` and check that `draw_text
+DrawTextBlob x=<positive> y=<positive>` lines appear in stdout), or
+attach Frida ad-hoc to a running gpu-process and read 16 bytes at the
+op address printed by the hook to confirm x/y look like sane pixel
+floats.
+
+## Phase 7 anchors: filled-rectangle capture
+
+Phase 7 (`draw_rect` events) needs three groups of offsets in
+`signatures.json:offsets`:
+
+- The PaintOpType enum indices `paint_op_kDrawRect` / `kDrawRRect` /
+  `kDrawIRect` / `kDrawOval` (currently 18 / 19 / 12 / 15). Bump only if
+  Chromium adds new enum variants — see `cc/paint/paint_op.h:85`.
+- Geometry field offsets `draw_rect_op_rect_offset` etc., all `0x50`
+  in Brave 1.90.122-1. Stable as long as `sizeof(PaintOpWithFlags)` doesn't
+  change (see § "Why 0x50" below).
+- Function addresses for the per-op static rasterizers
+  (`draw_rect_op_RasterWithFlags` etc.) and `SkCanvas::drawRect`.
+
+### Why 0x50
+
+`PaintOpWithFlagsBaseInternal` is `PaintOp` (uint8 `type` at +0, 7 B padding
+to align-8) + `PaintFlags`. `PaintFlags` inherits `CorePaintFlags`:
+
+| field | offset | size | notes |
+| --- | --- | --- | --- |
+| `color_` | +0x00 | 16 | SkColor4f (4 f32: R, G, B, A) |
+| `width_` | +0x10 | 4 | f32 stroke width |
+| `miter_limit_` | +0x14 | 4 | f32 |
+| `bitfields_` | +0x18 | 4 | packed flags / blend mode |
+| (padding to align-8) | +0x1c | 4 | |
+| `targeted_hdr_headroom_` (PaintFlags) | +0x20 | 4 | f32 |
+| (padding to align-8) | +0x24 | 4 | |
+| 5 × `sk_sp<>` (path_effect_, shader_, color_filter_, draw_looper_, image_filter_) | +0x28 | 8 each | |
+
+Total CorePaintFlags + PaintFlags = 0x48. Plus the 8-byte `PaintOp` header
+yields **0x50**, which is where the first derived-class member (e.g.
+`DrawRectOp.rect`, `DrawTextBlobOp.blob`) sits.
+
+Verified by disassembling the kDrawRect inlined case in the dispatcher
+(loads `(%r15)` = `color_` from flags, then later `0x10(%r15)` = width,
+`0x14(%r15)` = miter, `0x18(%r15)` = bitfields, …), and by the
+`add $0x50,%r14` in every per-op `RasterWithFlags` immediately before the
+SkCanvas call.
+
+### Refresh workflow
+
+#### Step P4 — locate the per-op RasterWithFlags table
+
+The four per-op functions are referenced from the
+`g_raster_with_flags_functions` array at known anchor
+`0x11a5ed20` (real VA, from Phase 6). Each slot is an 8-byte relative
+relocation pointing at a 5-byte `jmp rel32` stub, which tail-calls the
+actual function body.
+
+```bash
+# kDrawRect=18 → table base + 18*8 = +0x90 → slot at 11a5edb0
+# kDrawRRect=19 → +0x98 → slot at 11a5edb8
+# kDrawIRect=12 → +0x60 → slot at 11a5ed80
+# kDrawOval=15  → +0x78 → slot at 11a5ed98
+readelf -r /opt/brave-bin/brave 2>/dev/null \
+  | grep -E "11a5ed(80|98|b0|b8)\b"
+```
+
+You'll see four `R_X86_64_RELATIVE` entries pointing at jmp-stubs in the
+`malloc_size@@Base+…` region (currently `0x6fe96b0` / `c8` / `e0` / `e8`).
+Disassemble each stub to read the real target:
+
+```bash
+objdump -d --start-address=0x<stub_va> --stop-address=$((0x<stub_va> + 16)) /opt/brave-bin/brave
+# → `jmp rel32 <target>` — target is the per-op RasterWithFlags entry
+```
+
+Record each target as `draw_<kind>_op_RasterWithFlags` in
+`signatures.json:offsets`.
+
+**Verification:** disassemble each function body and confirm:
+- 4-arg signature (`rdi=op, rsi=flags, rdx=canvas, rcx=params`).
+- Allocates an SkPaint on the stack with `xorps + movaps` zeroing,
+  then `call <PaintFlags::DrawToSk> or <SkPaint ctor helper>`.
+- `add $0x50,%r14` (or `+0x50,%rNN` depending on which register
+  holds `op`) somewhere in the body, then `mov %rNN, %rsi` and
+  `call <SkCanvas::draw*>`.
+- For DrawIRect: extra `movups 0x50(%rNN), %xmm0; cvtdq2ps` (loads
+  4 int32, converts to floats) before the drawRect call.
+
+#### Step P5 — locate SkCanvas::drawRect
+
+SkCanvas::drawRect is the primary catch-all hook for filled rects (most
+PaintOpBuffer::Playback rect ops get LTO-inlined past the per-op
+RasterWithFlags entries; SkCanvas::drawRect catches everything that lands
+in Skia). It's reached from the inlined kDrawRect case in the dispatcher:
+
+```bash
+# Disassemble PaintOpWithFlags::RasterWithFlags around the kDrawRect inlined
+# branch (start ≈ dispatcher_va + 0x180), look for the final 5-byte rel32 call
+# right after `add $0x50,%r14` + `mov %r14, %rsi`:
+objdump -d --start-address=$((0x<dispatcher_va> + 0x180)) \
+             --stop-address=$((0x<dispatcher_va> + 0x420)) /opt/brave-bin/brave \
+  | grep -E "add\s+\\\$0x50,%r14" -A2 | head -10
+# That `call rel32` target = SkCanvas::drawRect's real VA.
+```
+
+Verify the function: large (>0x300 B), saves r12-r15+rbx, reads
+`movsd (%r15)` (loads 8 bytes from rsi=&rect) early in the body.
+
+#### Step P6 — verify end-to-end
+
+After updating `signatures.json:offsets`, run:
+
+```bash
+uv run python run.py -- --new-window https://en.wikipedia.org/wiki/HarfBuzz
+```
+
+Expect:
+- `hooked` lines for all of: `hb_shape_full`,
+  `PaintOpWithFlags::RasterWithFlags`, the four per-op
+  `Draw*Op::RasterWithFlags`, and `SkCanvas::drawRect`.
+- Hundreds of `draw_rect SkRect …` records with `l`, `t`, `r`, `b` floats
+  in a sane viewport range (e.g. `0..1300`).
+- A handful of `draw_rect DrawIRect`/`DrawRect`/`DrawRRect`/`DrawOval`
+  records with `color=#rrggbbaa` strings.
+- Existing `text` and `draw_text` records still flowing.
+
+## Phase 8 anchors: SkCanvas CTM read path
+
+Phase 8 emits screen-absolute `(sx, sy)` (and `sleft/stop/sright/sbottom`)
+alongside the layer-local coords by reading SkCanvas's current matrix at
+hook entry. It needs two struct offsets, both pinned in
+`signatures.json:offsets`:
+
+- `sk_canvas_mcrec_offset` — offset of `MCRec* SkCanvas::fMCRec`. In Brave
+  1.90.122-1: `0x640`.
+- `mcrec_matrix_offset` — offset of `SkM44 MCRec::fMatrix` within the
+  MCRec record. In Brave 1.90.122-1: `0x18` (after `fLayer`,
+  `fDevice`, `fBackImage` — three 8-byte pointers).
+
+Matrix kind is `SkM44`: 16 little-endian f32 in **column-major** layout,
+i.e. `fMat[c*4 + r] = m(r,c)`. For a 2D affine the consumer only needs
+`sx = m00·x + m01·y + m03` and `sy = m10·x + m11·y + m13`, which in
+SkM44 storage is `fMat[0]*x + fMat[4]*y + fMat[12]` and
+`fMat[1]*x + fMat[5]*y + fMat[13]`.
+
+### Refresh workflow
+
+Both offsets are stable for as long as Chromium-vendored Skia keeps the
+declaration order of `SkCanvas::fMCRecStorage / fMCStack / fMCRec` (see
+`include/core/SkCanvas.h`) and `MCRec::fLayer / fDevice / fBackImage /
+fMatrix` (same file). Refresh when:
+
+- `signatures.json:brave_build_id` no longer matches and the hooks
+  are reporting `draw_text` with sx/sy that look obviously wrong (NaN,
+  enormous magnitudes, or identical to x/y everywhere despite obvious
+  transform layers).
+- A new run shows `sx == x` and `sy == y` for *every* record (CTM read
+  is silently failing — either fMCRec offset is stale and dereferences
+  to garbage that null-checks pass but produces a zero / identity
+  matrix at offset +0x18, or it's null and `readCTM` returns null).
+
+#### Step P7 — verify the SkCanvas layout
+
+The reliable way to confirm both offsets in a fresh build is to
+disassemble a SkCanvas method that emits the matrix-load pattern. Two
+candidates known to work:
+
+- `SkCanvas::drawRect` — find its real VA via the Phase 7 workflow
+  (already an anchor in `signatures.json`).
+- `SkCanvas::drawTextBlob` — similar; anchor `SkCanvas_drawTextBlob`.
+
+Both functions, near the start of the call-into-Skia code path, emit:
+
+```
+mov 0x<SK_CANVAS_MCREC_OFF>(<this_reg>), %r<NN>
+add $0x<MCREC_MATRIX_OFF>, %r<NN>
+lea -0x<stack_offset>(%rbp), %rsi
+call <SkM44::mapRect>           ; ~+0x7000 forward in the same .text region
+```
+
+In Brave 1.90.122-1 the disassembly at `SkCanvas::drawRect+0x144`:
+
+```
+3f715b4: mov  0x640(%rbx),%rdi
+3f715bb: add  $0x18,%rdi
+3f715bf: lea  -0xb0(%rbp),%rsi
+3f715c6: call 3f6ebd0           ; SkM44::mapRect
+```
+
+`%rbx` holds `this` (loaded from `%rdi` at function entry). The
+`0x640` is `SK_CANVAS_MCREC_OFF`; the `0x18` is `MCREC_MATRIX_OFF`.
+
+Same sequence appears in `SkCanvas::drawTextBlob+0x376` and again
+`+0x4d3` with `%r13` instead of `%rbx`.
+
+To find the pattern in a new build:
+
+```bash
+# Find candidate hits inside SkCanvas::drawRect:
+objdump -d --start-address=0x<SkCanvas_drawRect_va> \
+             --stop-address=$((0x<SkCanvas_drawRect_va> + 0x800)) \
+             /opt/brave-bin/brave \
+  | grep -B1 -A2 -E 'mov\s+0x[0-9a-f]+\(%r[a-z0-9]+\),%r[a-z0-9]+' \
+  | grep -A2 'add\s+\$0x[0-9a-f]+,'
+```
+
+You want the unique `mov 0xN(thisreg), %rN; add $0xM, %rN` pair where
+`%rN` then becomes the `this` arg of a tight `call rel32` a few bytes
+later (the `SkM44::mapRect` invocation). `N` is `SK_CANVAS_MCREC_OFF`;
+`M` is `MCREC_MATRIX_OFF`.
+
+#### Step P8 — verify at runtime
+
+After updating `signatures.json:offsets.sk_canvas_mcrec_offset` and
+`mcrec_matrix_offset`, run end-to-end:
+
+```bash
+uv run python run.py -- --new-window https://en.wikipedia.org/wiki/HarfBuzz
+```
+
+Healthy output:
+
+- Each `draw_text DrawTextBlob` line carries `sx=... sy=...` followed
+  by `(x=... y=...)`.
+- For top chrome / nav (no CSS transforms), `sx ≈ x` and `sy ≈ y`.
+- For sub-layers (sticky headers, table-of-contents widget, scrolling
+  containers), `sx`/`sy` differ from `x`/`y` by the layer's screen
+  offset — e.g. `sl=19 st=10 sr=267 sb=51 (l=0 t=0 r=248 b=41)`
+  reveals a translation layer at (19, 10) on screen.
+- Scroll the page (PgDown). Records that re-paint after scrolling show
+  the same `(x,y)` mapping to a smaller `sy` than before — the
+  CTM translation tracks scroll position.
+
+Failure modes:
+
+- All `sx == x` and `sy == y`: `MCRec*` dereferences to a NULL or to
+  a struct where `+MCREC_MATRIX_OFF` happens to contain the identity.
+  Re-derive both offsets via Step P7. The Skia upstream layout shouldn't
+  have shifted — if it has, also check `MCRec::fBackImage` (might have
+  grown / shrunk and shoved fMatrix forward or back).
+- `sx/sy` are NaN or enormous (10⁸+): `fMCRec` offset is reading
+  arbitrary memory; double-check `0x640` against your build.
+- `sx == x` only for some records: those hooks may be reading the
+  wrong register as `canvas`. Verify the args[] indices in
+  `capture.js:installPaintOpHooks` against the disassembly of the
+  hooked function.
+
 ## When HarfBuzz's struct layout changes
 
 `hb_buffer_t` field offsets are tied to the **vendored HarfBuzz version**,
