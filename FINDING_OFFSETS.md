@@ -439,9 +439,19 @@ DrawTextBlobOp. They're recorded under `offsets:` in `signatures.json` as
 `paint_op_with_flags_RasterWithFlags`, `draw_text_blob_op_x_offset`, and
 `draw_text_blob_op_y_offset` (defaults `0x78` / `0x7c`).
 
-The dispatcher fires only in the **gpu-process** (`--type=gpu-process`),
-not in renderers. `run.py` and `capture.js` already filter on both
-process types.
+The dispatcher fires in **every process that does cc::PaintOp playback**.
+In Brave 1.90.122-1 with default flags that includes both renderers
+(one per tab; Brave's site-isolation keeps them separate) and the
+gpu-process. Empirical signature in a multi-tab capture: each renderer
+pid emits both `text` (from `hb_shape_full`) and `draw_text` (from
+this dispatcher); the gpu-process emits only `draw_rect` via the
+SkCanvas catch-all. `run.py` and `capture.js` accept both
+`--type=renderer` and `--type=gpu-process` and install the dispatcher
+hook in whichever process is attached.
+
+(Earlier notes in this repo claimed gpu-process only — that was
+incorrect; corrected after observing a 4-pid capture where 3 renderer
+pids each carried independent text+draw_text streams.)
 
 ### Refresh workflow
 
@@ -524,14 +534,22 @@ The kNumOpTypes value (currently 36) and the kDrawSlug / kDrawTextBlob
 enum indices (22 / 23) come from `cc/paint/paint_op.h:85` — bump
 them if Chromium adds new enum variants.
 
-#### Step P3 — verify in a live gpu-process
+#### Step P3 — verify in a live process
 
 Either re-run end-to-end (`uv run python run.py -- --new-window
 https://en.wikipedia.org/wiki/HarfBuzz` and check that `draw_text
 DrawTextBlob x=<positive> y=<positive>` lines appear in stdout), or
-attach Frida ad-hoc to a running gpu-process and read 16 bytes at the
-op address printed by the hook to confirm x/y look like sane pixel
+attach Frida ad-hoc to any attached process (renderer or gpu-process —
+see the dispatcher-fires-everywhere note above) and read 16 bytes at
+the op address printed by the hook to confirm x/y look like sane pixel
 floats.
+
+If you're verifying with the multi-tab capture flow + `render_ascii.py
+--list-pids`, you'll see one pid per tab carrying both `text` and
+`draw_text` records, plus a separate pid carrying only `draw_rect`
+records. That separate pid is the gpu-process; the others are
+renderers. Either category is a valid place to read DrawTextBlobOp
+fields from.
 
 ## Phase 7 anchors: filled-rectangle capture
 
